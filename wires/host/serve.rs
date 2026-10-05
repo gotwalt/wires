@@ -40,7 +40,7 @@ pub(crate) struct ServeArgs {
     #[arg(long)]
     pub(crate) check: bool,
     /// Hex 32-byte seed of this host's node key. Falls back to
-    /// `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`).
+    /// `--node-seed-file`, then the keystore (`node.seed`).
     #[arg(long, hide = true)]
     pub(crate) node_seed: Option<String>,
     /// Read the node key seed (hex) from this file instead of the keystore.

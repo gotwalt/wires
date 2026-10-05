@@ -67,8 +67,8 @@ pub struct HostBuilder {
 impl Host {
     /// Start building a host whose keystore is `home` (what `$WIRES_HOME` is
     /// for `wires`): its `node.seed`, `network.json` (`wires join <network>`
-    /// there), signed policy and address hints. The host reads nothing from
-    /// `$WIRES_HOME` or `$WIRES_NODE_SEED`.
+    /// there), signed policy and address hints. The host never reads
+    /// `$WIRES_HOME`.
     pub fn builder(home: impl Into<PathBuf>) -> HostBuilder {
         HostBuilder {
             home: home.into(),

@@ -1,6 +1,5 @@
 //! `wires mcp`: a stdio MCP server whose tools are the services you may call
-//! (the entries of your view, as `wires services` lists them), plus
-//! `tools.json` aliases.
+//! (the entries of your view, as `wires services` lists them).
 //!
 //! The view is followed, not read once (card 37): `wires mcp` holds a
 //! `view` subscription with a directory ([`crate::caller::view::follow`]),
@@ -12,7 +11,7 @@
 //! doesn't fill the model's context.
 //!
 //! wires in the stdio MCP clients people already use (Claude Desktop, IDEs).
-//! Each service (or alias) becomes one MCP tool taking `{ args?: string[],
+//! Each service becomes one MCP tool taking `{ args?: string[],
 //! stdin?: string, jq?: string, head?: integer, max_bytes?: integer }`; the
 //! last three shape the remote stdout in-process
 //! ([`shape`](crate::caller::shape)), as `wires call --jq/--head/--max-bytes`
@@ -35,17 +34,14 @@
 //! over Streamable HTTP, one request at a time
 //! ([`crate::gateway::mcp_http`]).
 
-use std::path::PathBuf;
-
 use anyhow::Result;
 use clap::Args;
-use library::Argv;
+use library::{Argv, ServiceName};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::caller::call::{CallOutcome, Caller, CredArgs, Credentials, WiresCaller};
+use crate::caller::call::{CallOutcome, Caller, Credentials, WiresCaller};
 use crate::caller::shape::{Shape, ShapeArgs, exit_code};
-use crate::caller::tools::{RemoteTool, ToolTarget, ToolsConfig};
 
 /// The newest MCP revision this server speaks (the stateless one).
 pub const LATEST_PROTOCOL_VERSION: &str = "2026-07-28";
@@ -164,10 +160,21 @@ pub(crate) fn is_modern(version: &str) -> bool {
     version >= FIRST_MODERN_VERSION
 }
 
-/// The MCP server state: the tool map, the caller that runs tools, and the
-/// protocol version agreed by `initialize` (if the client did one).
+/// One service in the caller's view, as an MCP tool offers it: its name and
+/// the description the signed policy gives it. Which host runs it is picked
+/// at call time ([`crate::caller::pick`]), never here.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ViewService {
+    /// The service's name (the MCP tool name).
+    pub name: ServiceName,
+    /// Its description in the signed policy.
+    pub description: String,
+}
+
+/// The MCP server state: the services it offers, the caller that runs them,
+/// and the protocol version agreed by `initialize` (if the client did one).
 pub struct McpServer<C> {
-    config: ToolsConfig,
+    services: Vec<ViewService>,
     caller: C,
     negotiated: Option<String>,
     redact_failures: bool,
@@ -175,10 +182,10 @@ pub struct McpServer<C> {
 }
 
 impl<C: Caller> McpServer<C> {
-    /// A server exposing `config`'s tools, running them through `caller`.
-    pub fn new(config: ToolsConfig, caller: C) -> Self {
+    /// A server offering `services`, running them through `caller`.
+    pub fn new(services: Vec<ViewService>, caller: C) -> Self {
         Self {
-            config,
+            services,
             caller,
             negotiated: None,
             redact_failures: false,
@@ -193,11 +200,11 @@ impl<C: Caller> McpServer<C> {
         self
     }
 
-    /// Serve `config`'s tools from now on; whether the tool list a client
-    /// sees changed.
-    pub fn set_tools(&mut self, config: ToolsConfig) -> bool {
-        let changed = self.config != config;
-        self.config = config;
+    /// Offer `services` from now on; whether the tool list a client sees
+    /// changed.
+    pub fn set_services(&mut self, services: Vec<ViewService>) -> bool {
+        let changed = self.services != services;
+        self.services = services;
         changed
     }
 
@@ -326,41 +333,28 @@ impl<C: Caller> McpServer<C> {
     /// Whether the services are too many to list one tool each (card 37):
     /// `tools/list` then offers [`SEARCH_TOOL`] and [`CALL_TOOL`].
     fn searching(&self) -> bool {
-        self.services().count() > SEARCH_THRESHOLD
+        self.services.len() > SEARCH_THRESHOLD
     }
 
-    /// The service tools (not the aliases), in order.
-    fn services(&self) -> impl Iterator<Item = &RemoteTool> {
-        self.config
-            .tools
-            .iter()
-            .filter(|t| t.target == ToolTarget::Service)
-    }
-
-    /// `tools/list`: every alias, then every service, in order (stable, so
-    /// clients and prompt caches can rely on it); past [`SEARCH_THRESHOLD`]
-    /// services, the aliases then [`SEARCH_TOOL`] and [`CALL_TOOL`]. A
-    /// modern reply carries the 2026-07-28 cache hints: `private`, since
-    /// the list is per caller.
+    /// `tools/list`: every service, in order (stable, so clients and prompt
+    /// caches can rely on it); past [`SEARCH_THRESHOLD`] services,
+    /// [`SEARCH_TOOL`] and [`CALL_TOOL`] instead. A modern reply carries the
+    /// 2026-07-28 cache hints: `private`, since the list is per caller.
     fn tools_list(&self, modern: bool) -> Value {
-        let searching = self.searching();
-        let mut tools: Vec<Value> = self
-            .config
-            .tools
-            .iter()
-            .filter(|t| !searching || t.target != ToolTarget::Service)
-            .map(|t| {
-                json!({
-                    "name": t.name.as_str(),
-                    "description": describe(t),
-                    "inputSchema": input_schema(),
+        let tools: Vec<Value> = if self.searching() {
+            vec![search_tool(self.services.len()), call_tool()]
+        } else {
+            self.services
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name.as_str(),
+                        "description": describe(t),
+                        "inputSchema": input_schema(),
+                    })
                 })
-            })
-            .collect();
-        if searching {
-            tools.push(search_tool(self.services().count()));
-            tools.push(call_tool());
-        }
+                .collect()
+        };
         if modern {
             json!({ "tools": tools, "ttlMs": LIST_TTL_MS, "cacheScope": "private" })
         } else {
@@ -375,7 +369,7 @@ impl<C: Caller> McpServer<C> {
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::new(INVALID_PARAMS, "tools/call: missing tool name"))?;
         let mut arguments = params.get("arguments").cloned();
-        let listed = |n: &str| self.config.tools.iter().find(|t| t.name.as_str() == n);
+        let listed = |n: &str| self.services.iter().find(|t| t.name.as_str() == n);
         let tool = match (name, listed(name)) {
             (_, Some(tool)) => tool,
             (SEARCH_TOOL, None) if self.searching() => {
@@ -383,17 +377,15 @@ impl<C: Caller> McpServer<C> {
             }
             (CALL_TOOL, None) if self.searching() => {
                 let service = take_service(&mut arguments)?;
-                self.services()
-                    .find(|t| t.name.as_str() == service)
-                    .ok_or_else(|| {
-                        RpcError::new(
-                            INVALID_PARAMS,
-                            format!(
-                                "no service named `{service}` that you may call \
-                                 (find one with `{SEARCH_TOOL}`)"
-                            ),
-                        )
-                    })?
+                listed(&service).ok_or_else(|| {
+                    RpcError::new(
+                        INVALID_PARAMS,
+                        format!(
+                            "no service named `{service}` that you may call \
+                             (find one with `{SEARCH_TOOL}`)"
+                        ),
+                    )
+                })?
             }
             _ => {
                 return Err(RpcError::new(
@@ -415,7 +407,7 @@ impl<C: Caller> McpServer<C> {
                 }));
             }
         };
-        let (text, is_error) = match self.caller.call(tool, argv, stdin).await {
+        let (text, is_error) = match self.caller.call(&tool.name, argv, stdin).await {
             Ok(outcome) => render_outcome(&shaped(&shape, outcome)),
             Err(e) => {
                 tracing::warn!("wires mcp: call to `{name}` failed: {e:#}");
@@ -444,8 +436,9 @@ impl<C: Caller> McpServer<C> {
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::new(INVALID_PARAMS, "`query` must be a string"))?;
         let needle = query.to_ascii_lowercase();
-        let found: Vec<&RemoteTool> = self
-            .services()
+        let found: Vec<&ViewService> = self
+            .services
+            .iter()
             .filter(|t| {
                 t.name.as_str().to_ascii_lowercase().contains(&needle)
                     || t.description.to_ascii_lowercase().contains(&needle)
@@ -609,7 +602,7 @@ fn input_schema() -> Value {
 /// The MCP description for `tool`: the first sentence of its description
 /// (card 38: the rest, and how to filter, are in
 /// [`instructions`]).
-fn describe(tool: &RemoteTool) -> String {
+fn describe(tool: &ViewService) -> String {
     first_sentence(&tool.description)
 }
 
@@ -761,14 +754,14 @@ fn end_line(text: &mut String) {
 }
 
 /// Serve MCP over `input`/`output` until `input` hits EOF, requests one at
-/// a time, in order; and follow `tools`, if given: each new tool list
+/// a time, in order; and follow `tools`, if given: each new list of services
 /// replaces the server's, and when it differs from what the client saw,
 /// the client hears [`LIST_CHANGED`] (between replies, never inside one).
 pub async fn serve_following<C, R, W>(
     server: &mut McpServer<C>,
     input: R,
     mut output: W,
-    mut tools: Option<tokio::sync::watch::Receiver<ToolsConfig>>,
+    mut tools: Option<tokio::sync::watch::Receiver<Vec<ViewService>>>,
 ) -> Result<()>
 where
     C: Caller,
@@ -799,7 +792,7 @@ where
                 }
                 let next = tools.as_mut().map(|rx| rx.borrow_and_update().clone());
                 if let Some(next) = next
-                    && server.set_tools(next)
+                    && server.set_services(next)
                 {
                     let note = json!({"jsonrpc": "2.0", "method": LIST_CHANGED});
                     output.write_all(format!("{note}\n").as_bytes()).await?;
@@ -810,72 +803,44 @@ where
     }
 }
 
-/// `wires mcp`: the credential and config flags `wires call` takes.
+/// `wires mcp`: no flags; the key, the network and the view are the
+/// keystore's (`$WIRES_HOME`).
 #[derive(Args)]
-pub struct McpArgs {
-    #[command(flatten)]
-    pub creds: CredArgs,
-    /// Read aliases from this file instead of `$WIRES_HOME/tools.json`.
-    #[arg(long, hide = true)]
-    pub tools_file: Option<PathBuf>,
-}
+pub struct McpArgs {}
 
-/// `config`'s aliases, then one [`ToolTarget::Service`] tool per view entry
-/// (its description in the signed policy). A service in the view wins: an alias with
-/// the name of any service the view holds is dropped (with a warning).
-pub(crate) fn with_services(mut config: ToolsConfig, view: &library::View) -> ToolsConfig {
-    config.tools.retain(|t| {
-        let registered =
-            library::ServiceName::new(t.name.as_str()).is_ok_and(|n| view.entry(&n).is_some());
-        if registered {
-            tracing::warn!(
-                "tools.json alias `{}` is shadowed by the service of that name in your view",
-                t.name
-            );
-        }
-        !registered
-    });
-    for e in &view.entries {
-        config.tools.push(RemoteTool {
+/// One [`ViewService`] per entry of `view`, in its order.
+pub(crate) fn services_in(view: &library::View) -> Vec<ViewService> {
+    view.entries
+        .iter()
+        .map(|e| ViewService {
             name: e.name.clone(),
             description: e.service.description.clone(),
-            target: ToolTarget::Service,
-            remote_tool: None,
-        });
-    }
-    config
+        })
+        .collect()
 }
 
-/// `wires mcp`: load this node's view (refreshing it if needed),
-/// `tools.json` aliases and credentials, subscribe to the view, then serve
-/// MCP on stdio, telling the client whenever the tool list changes.
+/// `wires mcp`: load this node's view (refreshing it if needed) and
+/// credentials, subscribe to the view, then serve MCP on stdio, telling the
+/// client whenever the tool list changes.
 ///
-/// In locked mode ([`Lock`](crate::caller::lock::Lock)) an override flag is
-/// refused before anything loads. A tool's `stdin` field is still accepted:
-/// it is text in the client's request, never a file this process reads.
-pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
+/// Locked mode doesn't apply: a tool's `stdin` field is text in the
+/// client's request, never a file this process reads.
+pub async fn mcp_cmd(_: McpArgs) -> Result<()> {
     use std::sync::Arc;
-    crate::caller::lock::Lock::detect()?.check(&a.creds, a.tools_file.as_deref())?;
-    let path = crate::caller::tools::resolve_path(a.tools_file.as_deref())?;
-    let aliases = ToolsConfig::load(&path)?;
-    let creds = Credentials::resolve(&a.creds)?;
+    let creds = Credentials::resolve()?;
     let ks = Arc::new(crate::admin::keystore::Keystore::resolve()?);
     let held = match crate::caller::call::usable_view(&ks, &creds).await {
         Ok(held) => Some(held),
         Err(e) => {
-            tracing::warn!("no view of your services yet ({e:#}): aliases only, until one arrives");
+            tracing::warn!("no view of your services yet ({e:#}): no tools, until one arrives");
             None
         }
     };
-    let config = match &held {
-        Some(h) => with_services(aliases.clone(), &h.view),
-        None => aliases.clone(),
-    };
-    tracing::info!(
-        "wires mcp: serving {} tool(s) from {}",
-        config.tools.len(),
-        path.display()
-    );
+    let services = held
+        .as_ref()
+        .map(|h| services_in(&h.view))
+        .unwrap_or_default();
+    tracing::info!("wires mcp: serving {} service(s)", services.len());
     // Follow the view: a grant or a revocation becomes `list_changed`.
     let endpoint = creds.bind().await?;
     let token_ks = Arc::clone(&ks);
@@ -887,16 +852,16 @@ pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
         fallback: crate::caller::view::joined_directories(&ks),
         persist: Some(Arc::clone(&ks)),
     });
-    let (tools_tx, tools_rx) = tokio::sync::watch::channel(config.clone());
+    let (tools_tx, tools_rx) = tokio::sync::watch::channel(services.clone());
     let mapper = tokio::spawn(async move {
         while views.changed().await.is_ok() {
             let next = views.borrow_and_update().clone();
             if let Some(held) = next {
-                tools_tx.send_replace(with_services(aliases.clone(), &held.view));
+                tools_tx.send_replace(services_in(&held.view));
             }
         }
     });
-    let mut server = McpServer::new(config, WiresCaller::new(creds)).with_list_changed();
+    let mut server = McpServer::new(services, WiresCaller::new(creds)).with_list_changed();
     let served = serve_following(
         &mut server,
         tokio::io::BufReader::new(tokio::io::stdin()),
@@ -913,15 +878,16 @@ pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library::{NodeIdentity, ServiceName};
+    use library::NodeIdentity;
     use proptest::prelude::*;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
-    /// One recorded call: tool name, argv, stdin.
+    /// One recorded call: service name, argv, stdin.
     type RecordedCall = (String, Vec<String>, Vec<u8>);
 
-    /// A scripted [`Caller`]: answers per tool name and records every call.
+    /// A scripted [`Caller`]: answers per service name and records every
+    /// call.
     #[derive(Default)]
     struct FakeCaller {
         answers: BTreeMap<String, std::result::Result<CallOutcome, String>>,
@@ -938,11 +904,11 @@ mod tests {
     impl Caller for FakeCaller {
         async fn call(
             &self,
-            tool: &RemoteTool,
+            service: &ServiceName,
             argv: Argv,
             stdin: Vec<u8>,
         ) -> anyhow::Result<CallOutcome> {
-            let name = tool.name.as_str().to_owned();
+            let name = service.as_str().to_owned();
             self.calls
                 .lock()
                 .unwrap()
@@ -959,16 +925,10 @@ mod tests {
         }
     }
 
-    fn entry(name: &str, description: &str) -> RemoteTool {
-        RemoteTool {
+    fn entry(name: &str, description: &str) -> ViewService {
+        ViewService {
             name: ServiceName::new(name).unwrap(),
             description: description.into(),
-            target: ToolTarget::Node {
-                node: NodeIdentity::from_seed([5; 32]).node_id(),
-                relay_url: None,
-                addrs: vec![],
-            },
-            remote_tool: None,
         }
     }
 
@@ -981,15 +941,12 @@ mod tests {
     }
 
     fn server() -> McpServer<FakeCaller> {
-        let config = ToolsConfig {
-            tools: vec![
-                entry("db_query", "Read-only SQL"),
-                entry("fails", "Always exits 2"),
-                entry("locked", "Refused"),
-                entry("offline", "Unreachable"),
-            ],
-            locked: false,
-        };
+        let services = vec![
+            entry("db_query", "Read-only SQL"),
+            entry("fails", "Always exits 2"),
+            entry("locked", "Refused"),
+            entry("offline", "Unreachable"),
+        ];
         let caller = FakeCaller::default()
             .answer("db_query", Ok(exited(0, "id\n1\n", "")))
             .answer("fails", Ok(exited(2, "partial", "boom\n")))
@@ -1001,7 +958,7 @@ mod tests {
                 "offline",
                 Err("dialing target: no answer within 10s".into()),
             );
-        McpServer::new(config, caller)
+        McpServer::new(services, caller)
     }
 
     fn rt() -> tokio::runtime::Runtime {
@@ -1448,31 +1405,24 @@ mod tests {
         )
     }
 
-    /// Card 28 §8: a service in the view beats an alias of the same name,
-    /// and every service in the view becomes a tool.
+    /// Every service in the view becomes a tool, with its description.
     #[test]
-    fn services_become_tools_after_the_aliases_and_shadow_them() {
-        let view = view_of(&[("orders-db", "Read-only SQL"), ("db_query", "shadowed")]);
-        let aliases = ToolsConfig {
-            tools: vec![entry("db_query", "an alias"), entry("mine", "kept")],
-            ..ToolsConfig::default()
-        };
-        let config = with_services(aliases, &view);
-        let names: Vec<_> = config.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["mine", "db_query", "orders-db"]);
-        assert_eq!(config.tools[0].description, "kept");
-        assert_eq!(config.tools[1].target, ToolTarget::Service);
-        assert_eq!(config.tools[1].description, "shadowed");
-        assert_eq!(config.tools[2].description, "Read-only SQL");
+    fn every_service_in_the_view_becomes_a_tool() {
+        let view = view_of(&[("orders-db", "Read-only SQL"), ("db_query", "SQL")]);
+        let services = services_in(&view);
+        let names: Vec<_> = services.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["db_query", "orders-db"]);
+        assert_eq!(services[0].description, "SQL");
+        assert_eq!(services[1].description, "Read-only SQL");
     }
 
     /// A service not in the view is not offered, and naming it anyway (as
     /// a tool, or through `call_service`) is refused here: the caller is
     /// never invoked, so no host is dialed. The gateway serves the same
-    /// tools ([`with_services`]).
+    /// tools ([`services_in`]).
     #[test]
     fn a_service_not_in_the_view_is_not_offered_or_called() {
-        let listed = with_services(ToolsConfig::default(), &view_of(&[("orders-db", "SQL")]));
+        let listed = services_in(&view_of(&[("orders-db", "SQL")]));
         let mut s = McpServer::new(listed, FakeCaller::default());
         let out = transcript(
             &mut s,
@@ -1497,10 +1447,7 @@ mod tests {
             .map(|i| (format!("svc-{i:02}"), "d".to_string()))
             .collect();
         let pairs: Vec<(&str, &str)> = many.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
-        let mut s = McpServer::new(
-            with_services(ToolsConfig::default(), &view_of(&pairs)),
-            FakeCaller::default(),
-        );
+        let mut s = McpServer::new(services_in(&view_of(&pairs)), FakeCaller::default());
         let out = transcript(
             &mut s,
             &[call(1, CALL_TOOL, json!({"service": "audit-log"}))],
@@ -1523,14 +1470,7 @@ mod tests {
             .chain([("orders-db".into(), "Read-only SQL over the orders".into())])
             .collect();
         let pairs: Vec<(&str, &str)> = many.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
-        let config = with_services(
-            ToolsConfig {
-                tools: vec![entry("mine", "an alias")],
-                ..ToolsConfig::default()
-            },
-            &view_of(&pairs),
-        );
-        let mut s = McpServer::new(config, FakeCaller::default());
+        let mut s = McpServer::new(services_in(&view_of(&pairs)), FakeCaller::default());
         let out = transcript(
             &mut s,
             &[
@@ -1552,7 +1492,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(listed, ["mine", SEARCH_TOOL, CALL_TOOL]);
+        assert_eq!(listed, [SEARCH_TOOL, CALL_TOOL]);
         let found = out[1]["result"]["content"][0]["text"].as_str().unwrap();
         assert_eq!(found, "orders-db: Read-only SQL over the orders");
         let none = out[2]["result"]["content"][0]["text"].as_str().unwrap();
@@ -1579,10 +1519,7 @@ mod tests {
             .map(|i| (format!("svc-{i:02}"), "d".to_string()))
             .collect();
         let pairs: Vec<(&str, &str)> = few.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
-        let s = McpServer::new(
-            with_services(ToolsConfig::default(), &view_of(&pairs)),
-            FakeCaller::default(),
-        );
+        let s = McpServer::new(services_in(&view_of(&pairs)), FakeCaller::default());
         let list = s.tools_list(false);
         assert_eq!(list["tools"].as_array().unwrap().len(), SEARCH_THRESHOLD);
     }
@@ -1591,11 +1528,8 @@ mod tests {
     /// only when it differs; `initialize` declares `listChanged`.
     #[tokio::test]
     async fn a_changed_view_is_announced_between_replies() {
-        let one = with_services(ToolsConfig::default(), &view_of(&[("a", "one")]));
-        let two = with_services(
-            ToolsConfig::default(),
-            &view_of(&[("a", "one"), ("b", "two")]),
-        );
+        let one = services_in(&view_of(&[("a", "one")]));
+        let two = services_in(&view_of(&[("a", "one"), ("b", "two")]));
         let (tx, rx) = tokio::sync::watch::channel(one.clone());
         let mut s = McpServer::new(one.clone(), FakeCaller::default()).with_list_changed();
         let (client, server_side) = tokio::io::duplex(4096);

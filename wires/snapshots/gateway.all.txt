@@ -18,7 +18,7 @@ Options:
       --trust-proxy-header
           Rate-limit by the client address a fronting proxy reports (`CF-Connecting-IP`, else `X-Forwarded-For`) instead of the TCP peer. Only behind a proxy that sets them: clients can send them too
       --relay-url <RELAY_URL>
-          Dial hosts through this relay instead of n0's (as `wires call --relay-url`)
+          Dial hosts and directories through this self-hosted relay instead of n0's
   -h, --help
           Print help
       --help-all

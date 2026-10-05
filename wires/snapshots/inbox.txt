@@ -7,7 +7,6 @@ Options:
       --timeout <TIMEOUT>  With --wait: give up after this long (`90s`, `10m`) and exit 124
       --json               One JSON object per message instead of a line
   -h, --help               Print help
-      --help-all           Also list the operator and credential flags
 
 Examples:
   wires inbox

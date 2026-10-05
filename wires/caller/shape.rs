@@ -30,12 +30,6 @@ use jaq_json::Val;
 /// Never replaces a non-zero remote exit code; see [`exit_code`].
 pub const EXIT_SHAPE: i32 = 2;
 
-/// How to call and filter without a shell, for `wires tools list` (and the
-/// agent reading it). `wires mcp` says the same in its own terms.
-pub const CALL_HINT: &str = "call: wires call <name> [--jq FILTER] [--head N] [--max-bytes N] -- <args>. \
-Filter with the command's own flags (e.g. gh --json f --jq …) or --jq/--head/--max-bytes; \
-there is no shell, so pipes are not available.";
-
 /// How much of an unparseable remote stdout an error message quotes.
 const SNIPPET_BYTES: usize = 160;
 

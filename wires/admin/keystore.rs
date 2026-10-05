@@ -123,44 +123,23 @@ impl Keystore {
 /// The file `join` and `login` store the network string in.
 pub(crate) const NETWORK_FILE: &str = "network.json";
 
-/// Resolve a node identity for `serve` / `call`: an inline `--node-seed`
-/// wins, then `$WIRES_NODE_SEED`, then an explicit `--node-seed-file`, then
-/// the keystore (`node.seed`).
+/// Resolve `wires serve`'s node identity: an inline `--node-seed` wins,
+/// then an explicit `--node-seed-file` (a container mounts its key), then
+/// the keystore's ([`node_identity_in`]). Every other command reads the
+/// keystore's alone.
 pub fn node_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeIdentity> {
     if let Some(hex) = inline {
         return NodeIdentity::from_seed_hex(hex).context("--node-seed");
     }
-    if let Some(hex) = std::env::var("WIRES_NODE_SEED")
-        .ok()
-        .map(Zeroizing::new)
-        .filter(|s| !s.is_empty())
-    {
-        return NodeIdentity::from_seed_hex(&hex).context("$WIRES_NODE_SEED");
-    }
     if let Some(path) = file {
         return read_identity_file(path);
     }
-    let ks = Keystore::resolve()?;
-    ks.read_node_identity()?.ok_or_else(|| {
-        anyhow!(
-            "no node key at {}: run `wires login <network>` (a caller) or `wires join \
-             <network>` (a host or directory) with the network string from your admin",
-            ks.path("node.seed").display()
-        )
-    })
+    node_identity_in(&Keystore::resolve()?)
 }
 
-/// Resolve the node identity for a command that already holds a keystore
-/// handle: `$WIRES_NODE_SEED` wins — the same environment variable the
-/// network commands honour — then `ks`'s own `node.seed`.
+/// The node identity in `ks` (`node.seed`), or an error naming how to make
+/// one. `$WIRES_HOME` is the one way to point a command at another keystore.
 pub fn node_identity_in(ks: &Keystore) -> Result<NodeIdentity> {
-    if let Some(hex) = std::env::var("WIRES_NODE_SEED")
-        .ok()
-        .map(Zeroizing::new)
-        .filter(|s| !s.is_empty())
-    {
-        return NodeIdentity::from_seed_hex(&hex).context("$WIRES_NODE_SEED");
-    }
     ks.read_node_identity()?.ok_or_else(|| {
         anyhow!(
             "no node key at {}: a caller runs `wires login <network>`, a host or directory \
@@ -371,7 +350,7 @@ mod tests {
         let got = node_identity(Some(&inline.expose_seed_hex()), None).unwrap();
         assert_eq!(got.node_id(), inline.node_id());
 
-        // With no inline/env, an explicit file is used.
+        // With no inline seed, an explicit file is used.
         let file_id = NodeIdentity::from_seed([6u8; 32]);
         let path = temp_dir().join("node.seed");
         write_secret(&path, &file_id.expose_seed_hex()).unwrap();

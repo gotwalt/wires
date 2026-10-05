@@ -175,7 +175,7 @@ async fn a_child_gets_a_minimal_environment_and_a_push_capability() {
         "HOME",
         "SSH_AUTH_SOCK",
         "USER",
-        "WIRES_NODE_SEED",
+        "WIRES_LOCKED",
     ] {
         assert!(
             !env.contains_key(gone),

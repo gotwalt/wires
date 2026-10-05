@@ -32,7 +32,6 @@ use url::Url;
 use crate::caller::call::{CallOutcome, Caller};
 use crate::caller::jwks::KeyFetcher;
 use crate::caller::mock_idp::MockIdp;
-use crate::caller::tools::RemoteTool;
 use crate::gateway::clients::{ClientKey, MetadataFetcher};
 use crate::gateway::sessions::Session;
 use crate::gateway::sessions::Store;
@@ -62,7 +61,7 @@ struct Recording {
 impl Caller for Recording {
     async fn call(
         &self,
-        tool: &RemoteTool,
+        service: &library::ServiceName,
         argv: library::Argv,
         _stdin: Vec<u8>,
     ) -> anyhow::Result<CallOutcome> {
@@ -70,7 +69,7 @@ impl Caller for Recording {
         // Overlap concurrent calls, so a token mix-up would show.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         self.seen.lock().unwrap().push((
-            tool.name.as_str().to_owned(),
+            service.as_str().to_owned(),
             argv.clone(),
             self.token.clone(),
         ));

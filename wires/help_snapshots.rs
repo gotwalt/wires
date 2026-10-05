@@ -18,7 +18,7 @@ use clap::{Command, CommandFactory};
 use library::{Refusal, RoleName, ServiceName, StateVersion};
 
 use crate::Cli;
-use crate::caller::lock::Refused;
+use crate::caller::lock::StdinRefused;
 use crate::help;
 use crate::host::gate::{
     GateRefusal, HOST_MISCONFIGURED, IDP_UNREACHABLE, NOT_ADMITTED, SIGN_IN_EXPIRED,
@@ -224,13 +224,7 @@ fn error_messages_match_their_snapshot() {
     let call = crate::caller::call::not_callable;
     lines.push(format!("wires: {} [exit 1]", call(&svc)));
     lines.push(format!("wires: {} [exit 1]", help::NOT_SIGNED_IN));
-    for refused in [
-        Refused::Flag("--node-seed"),
-        Refused::Env("WIRES_NODE_SEED"),
-        Refused::Stdin,
-    ] {
-        lines.push(format!("wires: {refused} [exit 2]"));
-    }
+    lines.push(format!("wires: {StdinRefused} [exit 2]"));
     lines.push(format!("wires: {} [exit 1]", help::NOT_JOINED));
     let ks = crate::admin::keystore::Keystore::at("/home/me/.wires");
     let Err(no_key) = crate::admin::keystore::node_identity_in(&ks) else {
@@ -252,7 +246,7 @@ fn error_messages_match_their_snapshot() {
     // Every one names its next step.
     for l in &lines {
         assert!(
-            help::has_next_step(l) || l.contains("drop it") || l.contains("instead"),
+            help::has_next_step(l) || l.contains("instead"),
             "no next step: {l}"
         );
     }

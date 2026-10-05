@@ -24,11 +24,7 @@ wires: no service named `orders-db` that you may call; see `wires services` [exi
 
 wires: not signed in: run `wires login` [exit 1]
 
-wires: --node-seed is not allowed in locked mode (set by the operator: WIRES_LOCKED=1 or "locked" in tools.json); drop it: only --jq, --head, --max-bytes, --verbose, the service name and its arguments are allowed [exit 2]
-
-wires: $WIRES_NODE_SEED is not allowed in locked mode (set by the operator: WIRES_LOCKED=1 or "locked" in tools.json): it overrides this node's credentials; ask your operator to unset it [exit 2]
-
-wires: stdin is not forwarded in locked mode (it can carry local files to the host; the operator can set WIRES_LOCKED_STDIN=allow); pass the input as arguments instead [exit 2]
+wires: stdin is not forwarded in locked mode (set by the operator: WIRES_LOCKED=1; stdin can carry local files to the host); pass the input as arguments instead [exit 2]
 
 wires: this node has not joined a network: run `wires login <network>` (a caller) or `wires join <network>` (a host or directory) with the string your admin prints with `wires network` [exit 1]
 
