@@ -726,7 +726,6 @@ fn open_browser(url: &Url, launch: bool) {
 
 /// `wires login`.
 pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
-    crate::init_logging();
     let ks = keystore::Keystore::resolve()?;
     if let Some(network) = &a.network {
         let joined = crate::caller::join::join_in(&ks, network)?;

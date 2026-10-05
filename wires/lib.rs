@@ -227,7 +227,7 @@ fn init_logging() {
     init_logging_with(LOG_FILTER);
 }
 
-/// [`init_logging`] for the dialing commands (`call`, `services`, `mcp`),
+/// [`init_logging`] for the dialing commands (`call`, `services`, `mcp`, `login`),
 /// whose stderr belongs to the remote CLI, and the admin's one-shot commands:
 /// [`QUIET_LOG_FILTER`] by default, so a successful run leaves nothing of
 /// wires' own on stderr but its notes.
@@ -326,6 +326,7 @@ pub fn run() {
             exit_with_code(runtime().block_on(caller::inbox::inbox_cmd(a)))
         }
         Command::Login(a) => {
+            init_quiet_logging();
             if let Err(e) = runtime().block_on(caller::login::login_cmd(a)) {
                 exit_with(e);
             }

@@ -156,14 +156,30 @@ pub(crate) fn remove_in(ks: &Keystore, a: WhoArgs) -> Result<Report> {
     };
     Ok(Report {
         stdout: format!(
-            "removed {who} (policy version {}; {} node and {} person ban(s); `wires restore` \
-             lifts it)",
+            "removed {who} (policy version {}; {}; `wires restore` lifts it)",
             state.version().0,
-            state.policy.bans.len(),
-            state.policy.person_bans.len()
+            ban_counts(&state.policy)
         ),
         ..Report::default()
     })
+}
+
+/// How many bans `policy` holds, naming only the kinds it has: `2 node
+/// bans`, `1 person ban`, or both joined by "and".
+fn ban_counts(policy: &Policy) -> String {
+    let count = |n: usize, kind: &str| match n {
+        0 => None,
+        1 => Some(format!("1 {kind} ban")),
+        n => Some(format!("{n} {kind} bans")),
+    };
+    [
+        count(policy.bans.len(), "node"),
+        count(policy.person_bans.len(), "person"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" and ")
 }
 
 /// [`restore_cmd`] against an explicit keystore, without the publish.
@@ -244,6 +260,10 @@ mod tests {
         let ks = admin();
         let out = remove_in(&ks, who("Eve@Example.com")).unwrap().stdout;
         assert!(out.contains("eve@example.com"), "{out}");
+        assert!(
+            out.contains("; 1 person ban;"),
+            "only the kinds held: {out}"
+        );
         let held = stored(&ks);
         let eve = Person::new(Issuer::new(library::GOOGLE_ISSUER), "eve@example.com");
         assert!(held.policy.person_bans.contains(&eve));
