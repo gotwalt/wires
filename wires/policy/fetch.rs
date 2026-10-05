@@ -240,7 +240,7 @@ fn stored(ks: &Keystore) -> Result<Held> {
 }
 
 // ---------------------------------------------------------------------------
-// Fetch (hosts and callers)
+// Fetch (hosts)
 // ---------------------------------------------------------------------------
 
 /// Ask `directories` in turn for a policy newer than the one `ks` holds,

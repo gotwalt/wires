@@ -101,7 +101,8 @@ impl Host {
     /// ended and the endpoint is closed, so nothing of the host outlives
     /// the returned future. Errors before serving if the signed policy
     /// doesn't assign every service to this host (after trying to pull a
-    /// newer one). Listens for no signal.
+    /// newer one); a host the policy lists as a directory waits for one
+    /// that does instead. Listens for no signal.
     pub async fn serve_until(self, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
         serve_until(self.serving, async {
             shutdown.await;
@@ -157,7 +158,7 @@ impl HostBuilder {
         self
     }
 
-    /// Let the host push to the members of `roles` (from the signed policy),
+    /// Let the host push to callers in `roles` (from the signed policy),
     /// tried in order, as `host.json`'s `push.allow` does: what a native
     /// service's [`Call::push_to_caller`](crate::Call::push_to_caller) needs.
     pub fn push_allow<R: Into<String>>(mut self, roles: impl IntoIterator<Item = R>) -> Self {

@@ -28,7 +28,7 @@ pub(crate) struct CallTrace {
     principal: Option<Principal>,
     /// The service called.
     service: ServiceName,
-    /// The registry role that admitted the caller.
+    /// The policy's role that admitted the caller.
     role: RoleName,
     /// When the gate admitted the call.
     started: Instant,

@@ -35,7 +35,7 @@ use crate::signed_policy::Policy;
 /// 4. [`Error::NoRole`] when no role in the policy matches the person
 ///    ([`Policy::any_role_admits`]);
 ///
-/// else `Ok`. A responder tells none of these apart to the caller.
+/// else `Ok`. A host or directory tells none of these apart to the caller.
 ///
 /// Doesn't check `policy` itself (verify it under the root, and check it is
 /// fresh, before deciding under it), nor the token (`principal` must come

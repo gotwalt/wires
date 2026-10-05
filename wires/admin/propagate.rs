@@ -34,7 +34,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use library::{NodeId, StateVersion};
 
-use super::keystore::{Keystore, write_text_mode};
+use super::keystore::{Keystore, write_private};
 use super::{Report, run_edit};
 use crate::policy::fetch;
 
@@ -180,7 +180,7 @@ fn note_reached(ks: &Keystore, delivered: &[NodeId]) -> Result<()> {
     }
     all.extend(delivered.iter().copied());
     let text = serde_json::to_string(&all).context("encoding the directories reached")?;
-    write_text_mode(&ks.path(REACHED_FILE), &format!("{text}\n"), Some(0o600))
+    write_private(&ks.path(REACHED_FILE), format!("{text}\n"))
 }
 
 /// Fold a publish into an admin command's report: its line is the last

@@ -12,7 +12,7 @@
 //!   `401` for a bad token.
 //! - [`concurrent_users_each_call_with_their_own_token`]: two users calling
 //!   at once through one gateway node each present their own token.
-//! - [`a_user_the_state_admits_to_nothing_is_refused_at_sign_in`]
+//! - [`a_user_who_may_call_nothing_is_refused_at_sign_in`]
 //! - [`a_code_is_single_use_and_bound_to_its_client`]
 //!
 //! The backend is scripted: the signed policy is fixed in the test (each
@@ -84,8 +84,14 @@ impl Caller for Recording {
 
 impl Backend for Scripted {
     type Caller = Recording;
-    /// The view a directory would cut for the session's (verified) user.
+    /// The view a directory would cut for the session's (verified) user,
+    /// or its refusal of a user the policy doesn't admit.
     async fn view(&self, session: &Session) -> anyhow::Result<Arc<View>> {
+        let node = crate::testutil::any_node();
+        if library::check_admitted(&self.state.to_policy()?, node, &session.principal).is_err() {
+            return Err(anyhow::anyhow!(crate::host::gate::NOT_ADMITTED)
+                .context(crate::caller::view::NotAdmitted));
+        }
         Ok(Arc::new(self.state.view_for(
             crate::testutil::any_node(),
             Some(&session.principal),
@@ -100,7 +106,7 @@ impl Backend for Scripted {
     }
 }
 
-/// A gateway (node 2 of [`state`]) on a loopback port, signing users in at
+/// A gateway (node 2 of [`signed_for`]) on a loopback port, signing users in at
 /// `idp`.
 struct Running {
     base: String,
@@ -629,13 +635,16 @@ async fn concurrent_users_each_call_with_their_own_token() {
     }
 }
 
+/// A user no role matches (a directory refuses her admission) is refused
+/// at the callback with the not-admitted sentence, not told to try again.
 #[tokio::test]
-async fn a_user_the_state_admits_to_nothing_is_refused_at_sign_in() {
+async fn a_user_no_role_matches_is_refused_at_sign_in() {
     let idp = MockIdp::start("mallory@example.com").await;
     let gw = Running::start(&idp).await;
     let client = gw.register().await;
     let q = gw.authorize(&client).await;
     assert_eq!(q["error"], "access_denied");
+    assert_eq!(q["error_description"], crate::gateway::NOT_ADMITTED_HERE);
     assert!(
         !q["error_description"].contains("mallory"),
         "no email leaked: {q:?}"

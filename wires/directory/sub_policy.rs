@@ -276,6 +276,7 @@ mod tests {
             DirectoryRequest::Policy {
                 have: StateVersion(have),
             },
+            0,
         )
     }
 

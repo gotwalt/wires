@@ -12,10 +12,10 @@
 //!   (the verified `Principal`, as JSON), and no `WIRES_*` name beyond the
 //!   ones wires sets.
 //! - [`the_capability_reaches_only_the_caller`]: the child's push reaches its
-//!   caller and is logged under the call; another node, a role and the
+//!   caller, even after the call ended; another node, a role and the
 //!   operator's request form are refused; the operator's own socket still
 //!   pushes to a role.
-//! - [`a_rolled_back_state_is_refused`]: a policy older than one the host
+//! - [`a_rolled_back_policy_is_refused`]: a policy older than one the host
 //!   already decided under, copied back onto disk, decides nothing.
 
 use std::collections::BTreeMap;
@@ -254,7 +254,7 @@ async fn a_child_gets_its_callers_id_token_and_verified_claims() {
     assert_eq!(json["issuer"], w.idp.issuer.as_str());
     assert_eq!(env["WIRES_CALLER_EMAIL"], "alice@example.com");
     assert_eq!(env["WIRES_SERVICE"], "env");
-    // The removed variables stay removed: every `WIRES_*` name is one of these.
+    // No `WIRES_*` name beyond the ones wires sets.
     for key in env.keys().filter(|k| k.starts_with("WIRES_")) {
         assert!(
             [
@@ -332,7 +332,7 @@ async fn the_capability_reaches_only_the_caller() {
 }
 
 #[tokio::test]
-async fn a_rolled_back_state_is_refused() {
+async fn a_rolled_back_policy_is_refused() {
     let w = World::new().await;
     let host = Host::start(&w).await;
     let ks = Keystore::at(&host.home);

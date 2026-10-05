@@ -81,7 +81,7 @@ pub struct Call {
     /// The person the caller's ID token verified as (the gate admits no
     /// one without one).
     pub(crate) principal: Principal,
-    /// The registry role that admitted the caller.
+    /// The policy's role that admitted the caller.
     pub(crate) role: RoleName,
     /// The service called.
     pub(crate) service: ServiceName,
@@ -92,11 +92,11 @@ pub struct Call {
 }
 
 /// A call's push capability, held in-process: the token the host minted for
-/// this call, the registry that decides whether it is still live, and the
+/// this call, the token store that decides whether it is still live, and the
 /// host's push service.
 #[derive(Clone)]
 pub(crate) struct CallerPush {
-    /// The live tokens (the same registry the child socket checks).
+    /// The live tokens (the same store the child socket checks).
     pub(crate) caps: Arc<Capabilities>,
     /// This call's token.
     pub(crate) token: PushToken,
@@ -162,14 +162,13 @@ impl Call {
 
     /// The person the caller verified as with their IdP: the claims of
     /// [`id_token`](Self::id_token), as the host verified them (a CLI
-    /// service gets the same value as JSON in `WIRES_CALLER`). Every
-    /// registry role names an issuer and no role admits a caller without a
-    /// verified ID token, so every admitted call has one.
+    /// service gets the same value as JSON in `WIRES_CALLER`). No caller is
+    /// admitted without a verified ID token, so every admitted call has one.
     pub fn principal(&self) -> &Principal {
         &self.principal
     }
 
-    /// The registry role that admitted the caller.
+    /// The policy's role that admitted the caller.
     pub fn role(&self) -> &RoleName {
         &self.role
     }

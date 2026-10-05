@@ -4,11 +4,11 @@ Usage: wires gateway [OPTIONS]
 
 Options:
       --public-url <PUBLIC_URL>
-          The public origin clients reach (the MCP endpoint is `<origin>/mcp`)
+          The public origin clients reach (the MCP endpoint is `<origin>/mcp`; or `$WIRES_GATEWAY_URL`)
       --listen <LISTEN>
           Where to listen for HTTP (TLS is the tunnel's or proxy's job) [default: 127.0.0.1:8080]
       --client-id <CLIENT_ID>
-          The IdP's Web application client id (hosts must trust it as an audience)
+          The IdP's Web application client id, which hosts must trust as an audience (or `$WIRES_GATEWAY_CLIENT_ID`)
       --client-secret-file <CLIENT_SECRET_FILE>
           Read the client secret from this file (or `$WIRES_GATEWAY_CLIENT_SECRET`)
       --issuer <ISSUER>

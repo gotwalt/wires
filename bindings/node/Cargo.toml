@@ -18,7 +18,6 @@ doctest = false
 wires = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
 napi = { version = "3", default-features = false, features = ["napi9", "tokio_rt"] }
 napi-derive = "3"
 

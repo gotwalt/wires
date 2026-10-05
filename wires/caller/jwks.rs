@@ -7,18 +7,18 @@
 //! caches the key set:
 //!
 //! - **in memory** per [`KeyFetcher`], and
-//! - for the caller's commands only, **on disk** under `$WIRES_HOME/jwks/`,
-//!   so a short-lived `wires call` or `wires services` does not refetch on
-//!   every start. A disk entry is trusted for at most [`MAX_TTL`] from the
-//!   moment it is read.
+//! - for the caller's commands and `wires gateway` only, **on disk** under
+//!   `$WIRES_HOME/jwks/`, so a short-lived `wires call` or `wires services`
+//!   does not refetch on every start. A disk entry is trusted for at most
+//!   [`MAX_TTL`] from the moment it is read.
 //!
-//! **A host never reads the disk cache** (`serve` builds its fetcher with
-//! no `cache_dir`): whatever runs as the host's user — a service child
-//! included — could plant an attacker's key there, and a host trusting it
-//! would accept forged identities. A host only trusts keys
-//! it fetched itself, over HTTPS, in this process. A caller keeps the disk
-//! cache: its keystore is its own, and whoever can write `jwks/` there can
-//! already read its node key and stored ID token.
+//! **A host or directory never reads the disk cache** (`serve` and the
+//! directory build their fetchers with no `cache_dir`): whatever runs as
+//! the host's user — a service child included — could plant an attacker's
+//! key there, and a host trusting it would accept forged identities. A host
+//! only trusts keys it fetched itself, over HTTPS, in this process. A caller
+//! keeps the disk cache: its keystore is its own, and whoever can write
+//! `jwks/` there can already read its node key and stored ID token.
 //!
 //! The cache TTL is the response's `Cache-Control: max-age`, clamped to
 //! [`MIN_TTL`]..=[`MAX_TTL`] ([`DEFAULT_TTL`] when absent). A token whose
@@ -92,6 +92,10 @@ pub(crate) struct KeyFetcher {
     discovery: Mutex<HashMap<Issuer, Discovery>>,
     /// When each issuer was last force-refetched for an unknown `kid`.
     forced: Mutex<HashMap<Issuer, i64>>,
+    /// When a fetch of each issuer's keys last failed, and why: not asked
+    /// again within [`MIN_TTL`], so an IdP that doesn't answer doesn't turn
+    /// every presented token into an outbound fetch.
+    failed: Mutex<HashMap<Issuer, (i64, String)>>,
 }
 
 impl KeyFetcher {
@@ -103,6 +107,7 @@ impl KeyFetcher {
             keys: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
             forced: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashMap::new()),
         })
     }
 
@@ -142,7 +147,8 @@ impl KeyFetcher {
     }
 
     /// The issuer's key set, from cache when fresh. When `kid` is given and
-    /// the cached set lacks it, refetch once (rate-limited per issuer).
+    /// the cached set lacks it, refetch once (rate-limited per issuer). A
+    /// fetch that failed is not retried within [`MIN_TTL`]: its error stands.
     pub(crate) async fn keys(&self, issuer: &Issuer, kid: Option<&str>, now: i64) -> Result<Jwks> {
         let cached = self.cached(issuer, now);
         match (&cached, kid) {
@@ -157,7 +163,18 @@ impl KeyFetcher {
             (Some(jwks), _) => return Ok(jwks.clone()),
             (None, _) => {}
         }
-        self.fetch(issuer, now).await
+        if let Some((at, why)) = self.failed.lock().expect("poisoned").get(issuer)
+            && now - at < MIN_TTL
+        {
+            bail!("{why} (not asked again for {}s)", MIN_TTL - (now - at));
+        }
+        let fetched = self.fetch(issuer, now).await;
+        let mut failed = self.failed.lock().expect("poisoned");
+        match &fetched {
+            Ok(_) => failed.remove(issuer),
+            Err(e) => failed.insert(issuer.clone(), (now, format!("{e:#}"))),
+        };
+        fetched
     }
 
     /// Verify `claim` against its issuer's current keys.
@@ -283,12 +300,9 @@ impl KeyFetcher {
         };
         let write = || -> Result<()> {
             if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
+                crate::admin::keystore::create_private_dir(dir)?;
             }
-            let tmp = path.with_extension("tmp");
-            std::fs::write(&tmp, serde_json::to_vec(cached)?)?;
-            std::fs::rename(&tmp, &path)?;
-            Ok(())
+            crate::admin::keystore::write_private(&path, serde_json::to_vec(cached)?)
         };
         if let Err(e) = write() {
             tracing::debug!(path = %path.display(), "jwks cache not written: {e:#}");
@@ -299,7 +313,7 @@ impl KeyFetcher {
 /// Why an identity claim could not be shown as verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VerifyError {
-    /// The token's issuer is not one this reader trusts.
+    /// The token's issuer is not one this verifier trusts.
     Untrusted(Issuer),
     /// The issuer's keys could not be fetched (network, bad document).
     Unavailable(String),
@@ -327,7 +341,8 @@ impl std::fmt::Display for VerifyError {
         match self {
             VerifyError::Untrusted(iss) => write!(
                 f,
-                "issuer {:?} is not trusted here (add it to host.json identity.issuers)",
+                "issuer {:?} is not trusted here (the signed policy trusts an IdP after `wires \
+                 issuer set`; host.json's identity.issuers can only narrow that)",
                 iss.as_str()
             ),
             VerifyError::Unavailable(e) => write!(f, "issuer keys unavailable: {e}"),
@@ -458,6 +473,40 @@ mod tests {
                 prop_assert_eq!(got, Some(n));
             }
         }
+    }
+
+    /// An IdP that doesn't answer is asked at most once per issuer per
+    /// [`MIN_TTL`]: a stream of tokens is not a stream of outbound fetches.
+    #[tokio::test]
+    async fn a_failed_fetch_is_not_retried_within_the_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = Issuer::new(format!("http://{}", listener.local_addr().unwrap()));
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&asked);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut s, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 503 Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let fetcher = KeyFetcher::new(None).unwrap();
+        let now = 1_000_000;
+        for t in [now, now + 1, now + MIN_TTL - 1] {
+            assert!(fetcher.keys(&issuer, None, t).await.is_err());
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert!(fetcher.keys(&issuer, None, now + MIN_TTL).await.is_err());
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "asked again after the window"
+        );
     }
 
     #[test]

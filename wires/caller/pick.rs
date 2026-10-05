@@ -26,7 +26,7 @@
 //! the key, so a wrong or stale hint fails the dial, never reaches an
 //! impostor. `wires serve` writes its own line to `$WIRES_HOME/run/hint`
 //! ([`write_own_hint`]) for a script to copy. Every endpoint this binary
-//! binds ([`transport::bind`]) registers the file, so calls, state sync,
+//! binds ([`transport::bind`]) registers the file, so calls, policy sync,
 //! push and inbox fetches all use it.
 
 use std::collections::BTreeMap;
@@ -50,7 +50,7 @@ pub(crate) const HINTS_FILE: &str = "hints";
 pub(crate) const OWN_HINT_FILE: &str = "run/hint";
 
 /// The hosts to try for `service` (its root-signed entry's), in order:
-/// `last_good` first if the entry still lists it, then the registry's
+/// `last_good` first if the entry still lists it, then the admin's
 /// order. A caller holds no ban list: a signed policy never lists a banned
 /// host (the admin's `remove` drops it from every service), and the host
 /// decides every call anyway.
@@ -97,9 +97,7 @@ impl LastGood {
         me.0.insert(service.clone(), host);
         let saved = serde_json::to_string_pretty(&me)
             .map_err(anyhow::Error::from)
-            .and_then(|json| {
-                crate::admin::keystore::write_text_mode(path, &format!("{json}\n"), Some(0o600))
-            });
+            .and_then(|json| crate::admin::keystore::write_private(path, format!("{json}\n")));
         if let Err(e) = saved {
             tracing::debug!("remembering the last good host: {e:#}");
         }
@@ -193,10 +191,10 @@ pub(crate) fn write_own_hint(ks: &Keystore, endpoint: &iroh::Endpoint) -> anyhow
     }
     let path = ks.path(OWN_HINT_FILE);
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::admin::keystore::create_private_dir(dir)?;
     }
     let me = transport::to_node_id(&endpoint.id());
-    crate::admin::keystore::write_text_mode(&path, &format!("{}\n", hint_line(me, &addrs)), None)
+    crate::admin::keystore::write_private(&path, format!("{}\n", hint_line(me, &addrs)))
 }
 
 /// Every host of the services in `names` that `view` holds, once each, in
@@ -269,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn last_good_first_then_registry_order() {
+    fn last_good_first_then_the_admins_order() {
         let v = view();
         let name = ServiceName::new("orders-db").unwrap();
         let svc = &v.entry(&name).unwrap().service;

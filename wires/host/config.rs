@@ -2,7 +2,7 @@
 //! policy assigns to it (card 27).
 //!
 //! Who may call a service is not the host's to say: the admin-signed
-//! registry names each service's roles and hosts, and (card 36) the IdPs
+//! policy names each service's roles and hosts, and (card 36) the IdPs
 //! the network trusts. The host file is the implementation, and may only be
 //! **stricter**:
 //!
@@ -35,15 +35,15 @@
 //!   a minimal environment: only `PATH`, `LANG` and `LC_*` are inherited
 //!   from `serve`; the server-derived `WIRES_*` values are set last), and
 //!   `also_require`: roles (defined in the
-//!   signed policy) the caller must **also** be in, on top of the registry's
+//!   signed policy) the caller must **also** be in, on top of the policy's
 //!   `allow`. It can only narrow. `end_of_options: true` (default false)
 //!   puts `--` between the fixed command and the caller's arguments, so a
 //!   CLI that honours `--` takes none of them as an option (`-X DELETE`
 //!   stays an operand). It only helps such CLIs: one that ignores `--`, or
 //!   reads it as an operand, is no safer, and its fixed command must still
 //!   be safe against any trailing arguments.
-//! - `push`: which registry roles may receive pushes from this host
-//!   (card 23).
+//! - `push`: which roles (from the signed policy) may receive pushes from
+//!   this host (card 23).
 //!
 //! What this parser checks is the file on its own. Checks against the signed
 //! policy (every service here is assigned to this host; every role named is
@@ -94,7 +94,7 @@ pub(crate) struct ServiceImpl {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) env: BTreeMap<String, String>,
     /// Roles (from the signed policy) the caller must also be in. Empty: the
-    /// registry's `allow` alone decides.
+    /// policy's `allow` alone decides.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) also_require: Vec<RoleName>,
     /// Put `--` between `command` and the caller's arguments, so a CLI
@@ -121,7 +121,7 @@ impl ServiceImpl {
     }
 }
 
-/// `push`: registry roles that may receive pushes.
+/// `push`: the roles (from the signed policy) that may receive pushes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Push {
@@ -286,7 +286,7 @@ impl HostConfig {
     /// Check this file against the signed policy, when `serve` starts (only
     /// then: a later policy that unassigns a service is enforced per call by
     /// the gate, which refuses it): every service here must be assigned
-    /// to `me` ("refuses to serve a name the registry doesn't assign to
+    /// to `me` ("refuses to serve a name the policy doesn't assign to
     /// it"), and every role in `also_require` and `push.allow` must be
     /// defined in `state` (the policy). The error names the first offender.
     pub(crate) fn check_against(&self, state: &Policy, me: NodeId) -> Result<()> {
@@ -451,9 +451,6 @@ mod tests {
             r#"{"version":2,"services":{"a":{"command":["x"]}},"tools":{}}"#,
             r#"{"version":2,"services":{"a":{"command":["x"],"allow":["sre"]}}}"#,
             r#"{"version":2,"services":{"a":{"command":["x"]}},"push":{"alow":[]}}"#,
-            // Retired: the call log's OTLP export and push bodies in it.
-            r#"{"version":2,"services":{"a":{"command":["x"]}},"audit":{"otlp":"https://c"}}"#,
-            r#"{"version":2,"services":{"a":{"command":["x"]}},"push":{"log_body":true}}"#,
         ] {
             assert!(HostConfig::parse(bad).is_err(), "{bad}");
         }

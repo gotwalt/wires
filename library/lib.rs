@@ -35,7 +35,7 @@
 //!   and [`verify_claim`], which a host runs against the issuer's [`Jwks`].
 //! - [`role`] — [`RoleName`], [`Matcher`], [`EmailPattern`]: role definitions.
 //! - [`registry`] — [`ServiceName`] and the registry entry [`Service`].
-//! - [`access`] — [`authorize`] and [`allowed_services`] over the policy.
+//! - [`access`] — [`authorize`]: may this caller call this service.
 //! - [`item`] — the policy's leaves: [`Item`] (role, service, node ban,
 //!   person ban, issuer, settings), its [`ItemKey`], and the [`Person`] a
 //!   person ban names.
@@ -68,8 +68,8 @@
 //! let alice = NodeIdentity::from_seed([3u8; 32]);
 //!
 //! // The admin signs the trusted IdPs, the roles, the service registry
-//! // (which hosts run each) and the bans: one versioned policy. No member
-//! // list: a caller is admitted by its IdP sign-in.
+//! // (which hosts run each) and the bans: one versioned policy. No list of
+//! // nodes: a caller is admitted by its IdP sign-in.
 //! let analyst = RoleName::new("analyst").unwrap();
 //! let orders = ServiceName::new("orders-db").unwrap();
 //! let mut s = Policy::new(root.node_id());
@@ -98,7 +98,7 @@
 //!
 //! // A host verifies the caller's ID token (bound to the key iroh
 //! // authenticated), admits it (a verified email, no ban, a role that
-//! // matches), then checks the registry, against its
+//! // matches), then checks the service's `allow`, against its
 //! // verified copy.
 //! signed.verify(root.node_id()).unwrap();
 //! let policy = signed.to_policy().unwrap();
@@ -112,7 +112,7 @@
 //! };
 //! check_admitted(&policy, alice.node_id(), &who).unwrap();
 //! assert_eq!(authorize(&policy, alice.node_id(), Some(&who), &orders), Ok(analyst));
-//! // Without a verified identity, the registry refuses (and says why).
+//! // Without a verified identity, the policy refuses (and says why).
 //! assert!(authorize(&policy, alice.node_id(), None, &orders).is_err());
 //! ```
 
@@ -169,7 +169,7 @@ mod codec;
 #[path = "calls/idp_vectors.rs"]
 mod idp_vectors;
 
-pub use access::{Grant, Refusal, allowed_services, authorize, role_admits};
+pub use access::{Refusal, authorize};
 pub use admission::check_admitted;
 pub use codec::B64;
 pub use directory::{

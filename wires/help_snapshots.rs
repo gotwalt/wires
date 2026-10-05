@@ -104,17 +104,40 @@ fn hides(path: &[String]) -> bool {
         .any(|a| a.is_hide_set() && a.get_long().is_some())
 }
 
+/// The snapshots the other tests here write: not a command's help.
+const NOT_HELP: &[&str] = &["mcp-server.txt", "errors.txt"];
+
 #[test]
 fn every_help_text_matches_its_snapshot() {
     let mut diffs = Vec::new();
-    diffs.extend(check("wires.txt", &help_of(&[])));
-    diffs.extend(check("wires.all.txt", &help_all_of(&[])));
+    let mut names: Vec<String> = NOT_HELP.iter().map(|s| s.to_string()).collect();
+    let mut snap = |name: String, actual: String| {
+        diffs.extend(check(&name, &actual));
+        names.push(name);
+    };
+    snap("wires.txt".into(), help_of(&[]));
+    snap("wires.all.txt".into(), help_all_of(&[]));
     for path in paths() {
         let p: Vec<&str> = path.iter().map(String::as_str).collect();
         let name = p.join("-");
-        diffs.extend(check(&format!("{name}.txt"), &help_of(&p)));
+        snap(format!("{name}.txt"), help_of(&p));
         if hides(&path) {
-            diffs.extend(check(&format!("{name}.all.txt"), &help_all_of(&p)));
+            snap(format!("{name}.all.txt"), help_all_of(&p));
+        }
+    }
+    // A snapshot that no command (or test here) writes describes something
+    // that is gone: an orphan. Blessing deletes it.
+    for entry in std::fs::read_dir(dir()).unwrap() {
+        let file = entry.unwrap().file_name().to_string_lossy().into_owned();
+        if names.contains(&file) {
+            continue;
+        }
+        if std::env::var_os("WIRES_BLESS").is_some() {
+            std::fs::remove_file(dir().join(&file)).unwrap();
+        } else {
+            diffs.push(format!(
+                "{file} is no command's snapshot (WIRES_BLESS=1 deletes it)"
+            ));
         }
     }
     assert!(diffs.is_empty(), "{}", diffs.join("\n\n"));
@@ -304,9 +327,10 @@ fn the_premise_is_short_and_in_the_right_words() {
 /// A refusal's next step is added only when the host's reason has none.
 #[test]
 fn a_refusal_gets_one_next_step() {
+    let own_rules = "alice@example.com is not admitted to orders-db by this host's own rules";
     assert_eq!(
-        help::refusal("removed from this network"),
-        "denied by host: removed from this network; don't retry: ask your admin for access"
+        help::refusal(own_rules),
+        format!("denied by host: {own_rules}; don't retry: ask your admin for access")
     );
     let login = "your ID token could not be verified; run `wires login`";
     assert_eq!(help::refusal(login), format!("denied by host: {login}"));

@@ -57,7 +57,7 @@ pub const ALPN: &[u8] = b"wires/session/1";
 const PUMP_BUF: usize = 64 * 1024;
 
 /// Largest frame body accepted off the wire once a session is admitted.
-/// Bounds what a member can make the host buffer; generous versus the 64 KiB
+/// Bounds what an admitted caller can make the host buffer; generous versus the 64 KiB
 /// stdio chunk size, but far below "exhaust memory".
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
@@ -443,7 +443,7 @@ where
     let err_bytes = err_task.await.context("stderr pump")??;
     // The child is gone, so there is nobody left to feed. Don't wait for the
     // dialer's stdin to reach EOF: from a terminal it never does, and a
-    // `wires call tool -- ARGS` whose child ignores stdin would hang until
+    // `wires call <service> -- ARGS` whose child ignores stdin would hang until
     // Ctrl-D.
     stdin_task.abort();
     let _ = stdin_task.await;
@@ -514,21 +514,27 @@ impl iroh::protocol::ProtocolHandler for ServicesProtocol {
         // Let the dialer read a `Denied` (or the final frames) before the
         // connection is torn down; bounded so a vanished dialer can't pin us.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
-        result.map_err(|e| {
-            if e.downcast_ref::<Refused>().is_some() {
+        match result {
+            Ok(()) => Ok(()),
+            // An ordinary refusal: already traced (its `call refused`
+            // line, or the throttled stranger line), and no error to the
+            // router, which would log it again as a failed connection.
+            Err(e) if e.downcast_ref::<Refused>().is_some() => {
                 tracing::debug!(caller = %caller.hex(), "{e:#}");
-            } else {
-                tracing::warn!(caller = %caller.hex(), "session failed: {e:#}");
+                Ok(())
             }
-            iroh::protocol::AcceptError::from_boxed(e.into())
-        })
+            Err(e) => {
+                tracing::warn!(caller = %caller.hex(), "session failed: {e:#}");
+                Err(iroh::protocol::AcceptError::from_boxed(e.into()))
+            }
+        }
     }
 }
 
 /// Refuse an **admitted** caller: write its log line
 /// ([`call_trace::refused`](crate::host::call_trace::refused)) and send the
 /// reason, cut as the frame carries it.
-async fn refuse_member<W: AsyncWrite + Unpin>(
+async fn refuse_admitted<W: AsyncWrite + Unpin>(
     send: &mut W,
     caller: NodeId,
     principal: Option<&library::Principal>,
@@ -585,7 +591,7 @@ where
 ///    Anyone else hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED)
 ///    (or that its sign-in expired, or the IdP is unreachable), writes no
 ///    log line, and is traced, throttled;
-/// 2. [`gate::admit`](crate::host::gate::admit): fresh → the registry lets
+/// 2. [`gate::admit`](crate::host::gate::admit): fresh → the policy lets
 ///    the caller call it (else one fixed sentence) → assigned here →
 ///    `also_require`;
 /// 3. whether `host.json` implements the service.
@@ -657,8 +663,8 @@ where
             return Err(Refused(reason.to_string()).into());
         }
     };
-    // Admission first: the token and the bans. A stranger costs one token
-    // check and no log line of its own.
+    // Admission first: the token, a verified email, the bans and a role. A
+    // stranger costs one token check and no log line of its own.
     let verified = match host
         .admit_caller(&state, caller, &hello.id_token, now)
         .await
@@ -674,14 +680,14 @@ where
         Ok(admitted) => admitted,
         Err(reason) => {
             let who = principal.as_ref();
-            return Err(refuse_member(&mut send, caller, who, &service, reason).await);
+            return Err(refuse_admitted(&mut send, caller, who, &service, reason).await);
         }
     };
     // Only an admitted caller learns whether this host implements it.
     let Some(implementation) = host.implementation(&service) else {
         let reason = format!("service {service} is not implemented on this host");
         let who = principal.as_ref();
-        return Err(refuse_member(&mut send, caller, who, &service, reason).await);
+        return Err(refuse_admitted(&mut send, caller, who, &service, reason).await);
     };
     drop(preauth);
     let version = admitted.state_version;
@@ -868,7 +874,7 @@ impl Denied {
     }
 
     /// The host's stated reason, verbatim (e.g. `not admitted to this
-    /// network; sign in with \`wires login\``).
+    /// network: sign in with \`wires login\`, or ask your admin for a role`).
     pub fn reason(&self) -> &str {
         &self.reason
     }
@@ -1159,7 +1165,7 @@ mod tests {
     }
 
     /// A host implementing service `t` as `command`, allowed to role `staff`
-    /// (anyone the shared test IdP verified); its signed policy bans
+    /// (anyone the shared test IdP verified with an email); its signed policy bans
     /// [`stranger`]`(7)`.
     fn host_running(command: &[&str]) -> Arc<ServicesHost> {
         Arc::new(host_unshared(command))
@@ -1729,13 +1735,13 @@ mod tests {
         assert_eq!(host.identities.nodes(), [caller]);
     }
 
-    /// The card's flood:    /// The card's flood: a thousand connections from keys that aren't
+    /// A flood: a thousand connections from keys that aren't
     /// admitted — junk, silence, out-of-turn frames, someone else's token,
     /// a genuine token on a banned node — leave no `call refused` line, and
     /// at most one throttled `info` report. An admitted caller's refusal is
     /// its own line.
     #[tokio::test]
-    async fn strangers_leave_no_call_lines_and_members_do() {
+    async fn strangers_leave_no_call_lines_and_admitted_callers_do() {
         let (lines, _guard) = crate::host::call_trace::capture::lines();
         let host = host_running(&["true"]);
         for n in 0..1000u32 {
@@ -1789,6 +1795,17 @@ mod tests {
         .await;
         let refused = lines.matching("call refused");
         assert_eq!(refused.len(), 1, "{}", lines.text());
+        // …and it is the refusal's only `info` line (the gate's detail is
+        // at `debug`).
+        let info: Vec<String> = lines
+            .matching(" INFO ")
+            .into_iter()
+            .filter(|l| l.contains("wires::"))
+            .filter(|l| !l.contains("unadmitted peer(s) since the last report"))
+            // Once per host, when it first verifies a token: not the call's.
+            .filter(|l| !l.contains("trusted issuers changed"))
+            .collect();
+        assert_eq!(info, refused, "{}", lines.text());
         let line = &refused[0];
         assert!(line.contains(" INFO "), "{line}");
         assert!(line.contains("service=nope"), "{line}");

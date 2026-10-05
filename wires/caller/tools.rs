@@ -138,14 +138,11 @@ impl ToolsConfig {
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            crate::admin::keystore::create_private_dir(dir)?;
         }
         let mut json = serde_json::to_string_pretty(self)?;
         json.push('\n');
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
-        Ok(())
+        crate::admin::keystore::write_private(path, json)
     }
 
     /// Append `tool`; an error if its name is already taken.
@@ -194,7 +191,7 @@ pub struct ToolsArgs {
 }
 
 /// The `wires tools` alias operations (optional: the signed policy's services
-/// are the directory; an alias pins a name to one host by hand).
+/// are the catalog, `wires services`; an alias pins a name to one host by hand).
 #[derive(Subcommand)]
 pub enum ToolsCmd {
     /// Add an alias: a service pinned to one host by its node id
@@ -399,6 +396,8 @@ mod tests {
         };
         c.save(&path).unwrap();
         assert_eq!(ToolsConfig::load(&path).unwrap(), c);
+        #[cfg(unix)]
+        crate::testutil::assert_private(path.parent().unwrap());
     }
 
     #[test]

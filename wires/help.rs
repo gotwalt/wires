@@ -22,7 +22,7 @@ pub const PREMISE: &str = "\
 wires is a network for authenticated remote CLI calls. Each service is a
 command-line program on another machine, run by its name, never by host or
 address. Every call runs as you: the machine that runs it checks your
-sign-in against an admin-signed list of who may call what. A refusal
+sign-in against an admin-signed policy of who may call what. A refusal
 (\"denied by host\", exit 77) is that policy, not a fault: don't retry or work
 around it; ask your admin for access.";
 
@@ -139,6 +139,7 @@ Examples:
   wires inbox --wait --timeout 10m
 
 Exit: 0 with messages printed (or none, without --wait); 124: --timeout ran out.
+1: not admitted to this network (a directory said so, and no view is held).
 77: every host refused this node (don't retry; ask your admin).";
 
 /// `wires mcp`: examples.

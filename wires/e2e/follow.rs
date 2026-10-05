@@ -6,10 +6,12 @@
 //! by the admin's publish ([`publish_all`]) or [`Directory::accept`]; hosts
 //! are [`Follower`]s, or whole hosts ([`serve_until`]) on hermetic loopback.
 //!
-//! - [`an_edit_reaches_every_subscribed_host_within_2s_as_one_update`]: and
+//! - [`an_edit_reaches_every_subscribed_host_within_2s_as_one_update`]: 2 s
+//!   after the publish is answered (the fan-out, not the admin's dial), and
 //!   what it costs each host, in frames and bytes.
 //! - [`a_host_that_missed_edits_catches_up_by_one_update_on_reconnect`]
 //! - [`an_update_that_does_not_apply_makes_the_host_take_the_whole_policy`]
+//! - [`an_update_this_host_already_holds_is_skipped_not_resynced`]
 //! - [`with_every_directory_down_lenient_keeps_serving`]
 //! - [`with_every_directory_down_strict_refuses_until_one_is_back`]
 //! - [`a_host_restarted_from_disk_serves_before_any_directory_answers`]
@@ -207,7 +209,7 @@ impl World {
         }
     }
 
-    /// Host `i` serving `echo` from `ks` (a whole host: gate, log,
+    /// Host `i` serving `echo` from `ks` (a whole host: gate, exec,
     /// follower), until the returned sender is dropped.
     async fn host(
         &self,
@@ -349,11 +351,23 @@ async fn an_edit_reaches_every_subscribed_host_within_2s_as_one_update() {
         .await
         .unwrap();
     assert_eq!(report.delivered, vec![w.dirs[0].node_id()]);
+    let published = started.elapsed();
     for h in &hosts {
         h.until(StateVersion(2)).await;
     }
     let took = started.elapsed();
-    assert!(took < Duration::from_secs(2), "the edit took {took:?}");
+    // The claim under test is that the directory pushes the edit to its
+    // subscribers as it takes it (docs: "within seconds"), not on the next
+    // beat (300 s by default) or a reconnect. So the budget is for the
+    // fan-out after the directory answered the publish; the admin's own
+    // dial and the publish (bounded by their timeouts) are printed, not
+    // budgeted, so a loaded machine's slow handshake doesn't fail it.
+    let fan_out = took - published;
+    eprintln!("publish answered in {published:?}; both hosts held it {fan_out:?} later");
+    assert!(
+        fan_out < Duration::from_secs(2),
+        "the subscribed hosts took {fan_out:?} after the publish"
+    );
     for (h, before) in hosts.iter().zip(&before) {
         let after = h.frames();
         assert_eq!(after.0, before.0, "no whole policy was sent");
@@ -433,6 +447,51 @@ async fn an_update_that_does_not_apply_makes_the_host_take_the_whole_policy() {
     assert_eq!(held.signed, w.last.lock().unwrap().clone().unwrap());
     h.task.abort();
     d.stop().await;
+}
+
+/// A host that is also a directory takes the admin's publish into its own
+/// `policy.json` (its directory mirrors what it accepts) before the
+/// directory it follows sends the same edit as an update from the version
+/// before. That update is already held: it is skipped, its `Fresh` kept,
+/// and nothing is resynced (it used to fail to apply, here on the ban the
+/// edit lifts, and fetch the whole policy).
+#[tokio::test]
+async fn an_update_this_host_already_holds_is_skipped_not_resynced() {
+    let w = World::new().await;
+    let v1 = w.policy(1, Settings::default(), 1);
+    let v2 = w.policy(2, Settings::default(), 0); // `wires restore`
+    let ks = w.keystore(&w.hosts[0], &v1);
+    let root = w.root.node_id();
+    let endpoint = w.bind(&w.hosts[0]).await;
+    let freshness = Arc::new(Freshness::load(
+        Arc::clone(&ks),
+        Some(&store::read(&ks, root).unwrap().unwrap().signed.head),
+    ));
+    let follower = Follower {
+        endpoint: endpoint.clone(),
+        ks: Arc::clone(&ks),
+        root,
+        freshness: Arc::clone(&freshness),
+        runs_directory: true,
+        stats: Arc::new(FollowStats::default()),
+    };
+    // Its own directory got there first.
+    let now = now_unix();
+    assert!(store::adopt_if_newer(&ks, &v2, root, now).unwrap());
+    let fresh = library::Fresh::sign(&w.dirs[1], &v2.head, now, now + 300).unwrap();
+    let update = library::SubFrame::PolicyUpdate {
+        update: v2.update_from(&v1),
+        fresh,
+    };
+    follower.take(update, now).unwrap();
+    let held = store::read(&ks, root).unwrap().unwrap();
+    assert_eq!(held.signed, v2);
+    assert_eq!(
+        freshness.vouched(&held.signed.head, now),
+        Vouched::Current,
+        "the update's Fresh vouches for the head it already holds"
+    );
+    endpoint.close().await;
 }
 
 /// Short intervals: a `Fresh` every second, good for three.

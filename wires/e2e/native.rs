@@ -14,8 +14,8 @@
 //! - [`an_unassigned_native_service_refuses_to_start`]
 //! - [`a_native_service_pushes_to_its_caller`]: `push_to_caller` goes through
 //!   the call's push capability and `push.allow`; a host without push says
-//!   so, and `push.allow` refuses a caller
-//!   in none of its roles.
+//!   so.
+//! - [`push_allow_refuses_a_caller_in_none_of_its_roles`]
 //! - [`each_verified_person_gets_their_own_kv`]: two admitted people, two
 //!   namespaces.
 //! - [`native_and_cli_services_share_one_host`]: `host.json`'s CLI services

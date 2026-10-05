@@ -11,12 +11,10 @@
 //! only its view (`view.json`, [`crate::caller::view`], card 37). A directory keeps its own copy in
 //! `directory.redb` ([`crate::directory`]).
 
-use std::fs::OpenOptions;
-
 use anyhow::{Context, Result, bail};
 use library::{NodeId, Policy, SignedPolicy, StateVersion};
 
-use crate::admin::keystore::{Keystore, create_private_dir, write_text_mode};
+use crate::admin::keystore::{Keystore, create_private_dir, open_private, write_private};
 
 /// The file name under `$WIRES_HOME`.
 pub(crate) const POLICY_FILE: &str = "policy.json";
@@ -101,12 +99,7 @@ pub(crate) fn adopt_if_newer(
     if let Some(dir) = lock_path.parent() {
         create_private_dir(dir)?;
     }
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
+    let lock = open_private(&lock_path)?;
     lock.lock()
         .with_context(|| format!("locking {}", lock_path.display()))?;
 
@@ -120,14 +113,8 @@ pub(crate) fn adopt_if_newer(
     if text.contains('\n') {
         bail!("an encoded policy must be one line");
     }
-    write_text_mode(&ks.path(POLICY_FILE), &format!("{text}\n"), Some(0o600))?;
+    write_private(&ks.path(POLICY_FILE), format!("{text}\n"))?;
     Ok(true)
-}
-
-/// The network root this keystore belongs to
-/// ([`Keystore::network_root`]); `None` before `init`, `join` or `login`.
-pub(crate) fn fabric(ks: &Keystore) -> Result<Option<NodeId>> {
-    ks.network_root()
 }
 
 #[cfg(test)]

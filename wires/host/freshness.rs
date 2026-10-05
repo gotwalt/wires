@@ -32,7 +32,7 @@ use anyhow::{Context, Result};
 use library::StateVersion;
 use library::{Fresh, SignedPolicyHead};
 
-use crate::admin::keystore::{Keystore, write_text_mode};
+use crate::admin::keystore::{Keystore, write_private};
 
 /// The file under `$WIRES_HOME` holding the newest `Fresh` for the held
 /// head.
@@ -115,7 +115,7 @@ impl Freshness {
             *held = Some(fresh.clone());
         }
         let text = serde_json::to_string(fresh).context("encoding a freshness")?;
-        write_text_mode(&self.ks.path(FRESH_FILE), &format!("{text}\n"), Some(0o600))?;
+        write_private(&self.ks.path(FRESH_FILE), format!("{text}\n"))?;
         Ok(true)
     }
 

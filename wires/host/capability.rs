@@ -210,7 +210,7 @@ fn prune(grants: &mut HashMap<PushToken, Grant>, now: Instant) {
 /// fails half-way still has its token expire.
 #[derive(Debug)]
 pub(crate) struct CallCapability {
-    /// The registry it was minted in.
+    /// The token store it was minted in.
     caps: Arc<Capabilities>,
     /// The token.
     token: PushToken,
@@ -229,7 +229,7 @@ impl Drop for CallCapability {
     }
 }
 
-/// What `serve` hands its sessions when push is on: the token registry and
+/// What `serve` hands its sessions when push is on: the live tokens and
 /// where the child socket is.
 #[derive(Clone, Debug)]
 pub(crate) struct PushGrants {

@@ -14,7 +14,7 @@
 //!    `settings.freshness: strict`, vouched for by a current `Fresh` from a
 //!    directory ([`freshness`](super::freshness); `lenient`, the default,
 //!    only traces a lapse);
-//! 3. the registry allows the caller to call the service
+//! 3. the policy allows the caller to call the service
 //!    ([`library::authorize`]: it exists, and a role in its `allow` admits
 //!    the caller). If not, whatever the reason, the caller hears one fixed
 //!    sentence ([`not_callable`]) and the reason goes to the trace: a host
@@ -42,7 +42,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use library::{
     FreshnessMode, IdToken, NodeId, Principal, Refusal, RoleName, ServiceName, StateVersion,
-    authorize, role_admits,
+    authorize,
 };
 
 use crate::admin::keystore::Keystore;
@@ -58,7 +58,7 @@ use crate::policy::store::Held;
 /// untrusted issuer, another audience, another key's, no verified email, a
 /// banned node or person, no role that matches). It says nothing about the
 /// policy, its version or who is in it; the exact reason goes only to the
-/// responder's trace. A signed-in caller says more, from its own token
+/// host's or directory's trace. A signed-in caller says more, from its own token
 /// ([`crate::caller::hello::explain_not_admitted`]).
 pub(crate) const NOT_ADMITTED: &str =
     "not admitted to this network: sign in with `wires login`, or ask your admin for a role";
@@ -129,7 +129,7 @@ pub(crate) struct NotAdmitted {
 /// A call the gate admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Admitted {
-    /// The registry role that admitted the caller (`WIRES_ROLE`, and the
+    /// The policy's role that admitted the caller (`WIRES_ROLE`, and the
     /// call's log line).
     pub(crate) role: RoleName,
     /// The policy version the decision was made under.
@@ -163,16 +163,16 @@ pub(crate) enum GateRefusal {
         /// Why, for the trace.
         why: String,
     },
-    /// The registry refused ([`library::authorize`]): no such service,
+    /// The policy refused ([`library::authorize`]): no such service,
     /// nobody allowed, or no role of the caller's in its `allow`. The caller
     /// hears [`not_callable`] whichever it was.
     NotCallable {
         /// The service asked for.
         service: ServiceName,
-        /// The registry's reason, for the trace only.
+        /// The policy's reason, for the trace only.
         refusal: Refusal,
     },
-    /// The caller may call the service, but the registry doesn't assign it
+    /// The caller may call the service, but the policy doesn't assign it
     /// to this host.
     NotAssigned {
         /// The service.
@@ -180,12 +180,12 @@ pub(crate) enum GateRefusal {
         /// The policy version it decided under.
         version: StateVersion,
     },
-    /// The registry admitted the caller, but this host's `also_require`
+    /// The policy admitted the caller, but this host's `also_require`
     /// did not.
     AlsoRequire {
         /// The service.
         service: ServiceName,
-        /// Every role this host requires on top of the registry.
+        /// Every role this host requires on top of the policy's `allow`.
         roles: Vec<RoleName>,
         /// Who the caller verified as.
         principal: String,
@@ -267,7 +267,7 @@ pub(crate) fn admit(
         .get(service)
         .map(|svc| svc.also_require.as_slice())
         .unwrap_or_default();
-    if !also.iter().all(|r| role_admits(s, r, principal)) {
+    if !also.iter().all(|r| s.role_admits(r, principal)) {
         return Err(GateRefusal::AlsoRequire {
             service: service.clone(),
             roles: also.to_vec(),
@@ -434,18 +434,24 @@ impl ServicesHost {
         token: &IdToken,
         now: i64,
     ) -> std::result::Result<Verified, NotAdmitted> {
+        // A banned node is banned whatever its token says.
         let refused = |said, why| NotAdmitted {
             said,
             why,
-            banned: false,
+            banned: state.policy.bans_node(caller),
         };
         let principal = match self.identities.verify_token(caller, token, now).await {
             Ok(p) => p,
             Err(VerifyError::Expired(p)) => {
-                return Err(refused(
-                    SIGN_IN_EXPIRED,
-                    format!("the ID token for {} has expired", p.name()),
-                ));
+                // Genuine but expired: it still names the person, so a ban
+                // on them still counts.
+                return Err(NotAdmitted {
+                    banned: state.policy.bans_node(caller) || state.policy.bans_person(&p),
+                    ..refused(
+                        SIGN_IN_EXPIRED,
+                        format!("the ID token for {} has expired", p.name()),
+                    )
+                });
             }
             Err(VerifyError::Unavailable(e)) => {
                 return Err(refused(
@@ -533,21 +539,23 @@ impl ServicesHost {
     ) -> std::result::Result<Admitted, String> {
         self.check_vouched(state, now).map_err(|r| r.to_string())?;
         admit(state, &self.config, self.me, caller, verified, service, now)
+            // The detail is for `debug`: the one `info` line a refusal makes
+            // is its `call refused` line (call_trace).
             .inspect_err(|r| match r {
-                GateRefusal::AlsoRequire { roles, .. } => tracing::info!(
+                GateRefusal::AlsoRequire { roles, .. } => tracing::debug!(
                     caller = %caller.hex(),
                     service = %service,
                     also_require = ?roles.iter().map(RoleName::as_str).collect::<Vec<_>>(),
                     "refused by this host's also_require"
                 ),
                 // The caller hears one fixed sentence; which it was is here.
-                GateRefusal::NotCallable { refusal, .. } => tracing::info!(
+                GateRefusal::NotCallable { refusal, .. } => tracing::debug!(
                     caller = %caller.hex(),
                     service = %service,
                     why = %refusal,
-                    "refused by the registry"
+                    "refused by the signed policy"
                 ),
-                GateRefusal::NotAdmitted { why } => tracing::info!(
+                GateRefusal::NotAdmitted { why } => tracing::debug!(
                     caller = %caller.hex(),
                     service = %service,
                     why = %why,
@@ -616,7 +624,7 @@ impl ServicesHost {
         }
         if let Some(role) = allow
             .iter()
-            .find(|r| role_admits(&state.policy, r, principal.as_ref()))
+            .find(|r| state.policy.role_admits(r, principal.as_ref()))
         {
             return Ok((principal, role.clone()));
         }
@@ -652,7 +660,7 @@ impl ServicesHost {
             .into_iter()
             .filter(|n| {
                 self.identities.current(*n, now).is_some_and(|p| {
-                    library::check_admitted(s, *n, &p).is_ok() && role_admits(s, role, Some(&p))
+                    library::check_admitted(s, *n, &p).is_ok() && s.role_admits(role, Some(&p))
                 })
             })
             .collect();
@@ -697,7 +705,7 @@ mod tests {
     }
 
     /// Root 1; 2 calls and 3 is this host; node 9 and mallory are banned;
-    /// `status` (staff: anyone [`ISS`] verified) on 3.
+    /// `status` (staff: anyone [`ISS`] verified with an email) on 3.
     fn setup() -> (Held, HostConfig) {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let mut s = Policy::new(root.node_id());
@@ -865,7 +873,7 @@ mod tests {
     fn also_require_only_narrows() {
         let (s, cfg) = strict();
         let db = name("orders-db");
-        // alice: analyst (registry) and sre (host) — admitted as analyst.
+        // alice: analyst (policy) and sre (host) — admitted as analyst.
         let alice = who("alice@x.com");
         let ok = admit(&s, &cfg, node(3), node(2), &alice, &db, 0).unwrap();
         assert_eq!(ok.role, role("analyst"));
@@ -896,12 +904,12 @@ mod tests {
     }
 
     proptest! {
-        /// The host never admits more than the registry: whatever
+        /// The host never admits more than the policy: whatever
         /// `also_require` says, an admitted caller is one `authorize`
         /// admits, is in **every** `also_require` role, and was decided
         /// under a fresh policy.
         #[test]
-        fn the_gate_never_widens_the_registry(
+        fn the_gate_never_widens_the_policy(
             caller in 1u8..6,
             email in prop::sample::select(vec![
                 "alice@x.com", "carol@x.com", "eve@y.com", "mallory@x.com",
@@ -928,7 +936,7 @@ mod tests {
                 prop_assert!(authorize(&s.policy, node(caller), principal, &svc).is_ok());
                 let required = cfg.services.get(&svc).map(|i| i.also_require.clone());
                 for r in required.unwrap_or_default() {
-                    prop_assert!(role_admits(&s.policy, &r, principal), "not in {}", r);
+                    prop_assert!(s.policy.role_admits(&r, principal), "not in {}", r);
                 }
                 prop_assert!(s.check_fresh(now).is_ok());
                 // Admitted is verified: the very token and principal given.

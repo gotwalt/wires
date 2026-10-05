@@ -5,15 +5,15 @@
 //! caller holds only the services it may use (its [`View`](crate::View)), so
 //! each service entry also carries its own root signature: a caller checks
 //! each entry alone, against the root key it joined with, and a directory can
-//! neither forge one nor move one to another fabric.
+//! neither forge one nor move one to another network.
 //!
 //! The service item in the policy *is* the signed entry, so the head's
 //! `items_hash` covers it too.
 //!
 //! - **Signed bytes:** [`ENTRY_CONTEXT`] followed by the canonical JSON of
 //!   every field but `sig`.
-//! - **Format:** [`ENTRY_V2`], signed; unknown fields are refused at decode.
-//!   Format 1 also carried the service's `readers`; it is refused.
+//! - **Format:** [`ENTRY_V2`], signed; any other format is refused, and
+//!   unknown fields are refused at decode.
 //! - **`version`** is the policy version at which the entry last changed. An
 //!   edit re-signs only the entries it changes
 //!   ([`Policy::sign_after`](crate::Policy::sign_after)); the rest keep their
@@ -29,7 +29,7 @@
 //! let name = ServiceName::new("status").unwrap();
 //! let entry = SignedEntry::sign(&root, StateVersion(4), name, service).unwrap();
 //! entry.verify(root.node_id()).unwrap();
-//! // Another fabric's root doesn't vouch for it.
+//! // Another network's root doesn't vouch for it.
 //! assert!(entry.verify(NodeIdentity::from_seed([2u8; 32]).node_id()).is_err());
 //! ```
 
@@ -41,8 +41,7 @@ use crate::head::StateVersion;
 use crate::identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
 use crate::registry::{Service, ServiceName};
 
-/// The current (and only accepted) signed-entry format. Format 1, whose
-/// [`Service`] also named `readers`, is refused.
+/// The current (and only accepted) signed-entry format.
 pub const ENTRY_V2: u8 = 2;
 
 /// Domain-separation prefix of a signed entry's bytes.
@@ -72,7 +71,7 @@ pub struct SignedEntry {
 
 impl SignedEntry {
     /// Sign `service` as entry `name` at `version` with the root key (the
-    /// fabric is the root's node id).
+    /// entry's `fabric` is the root's node id).
     pub fn sign(
         root: &NodeIdentity,
         version: StateVersion,
@@ -100,7 +99,7 @@ impl SignedEntry {
     }
 
     /// Verify it on its own: format and algorithm, the `fabric == root` pin
-    /// ([`Error::InvalidSignature`] for another fabric's entry), and the
+    /// ([`Error::InvalidSignature`] for another network's entry), and the
     /// root's signature. Says nothing about which head it is served under
     /// (a [`View`](crate::View) or [`SignedPolicy`](crate::SignedPolicy)
     /// checks `version` against its head).
@@ -227,7 +226,7 @@ mod tests {
                 "{t:?}"
             );
         }
-        // Another fabric's root signed it: refused under ours.
+        // Another network's root signed it: refused under ours.
         let other = NodeIdentity::from_seed([9u8; 32]);
         let foreign =
             SignedEntry::sign(&other, StateVersion(4), good.name.clone(), service()).unwrap();
@@ -241,7 +240,7 @@ mod tests {
         relabelled.fabric = root().node_id();
         assert!(relabelled.verify(root().node_id()).is_err());
 
-        // Format 1 (with `readers`) and any later format: refused.
+        // Any other format: refused.
         for format in [1, ENTRY_V2 + 1] {
             let mut t = good.clone();
             t.format = format;
@@ -272,14 +271,6 @@ mod tests {
     fn unknown_fields_are_refused() {
         let mut v = serde_json::to_value(entry()).unwrap();
         v["extra"] = serde_json::json!(1);
-        assert!(serde_json::from_value::<SignedEntry>(v).is_err());
-    }
-
-    #[test]
-    fn a_format_1_entry_with_readers_is_refused_at_decode() {
-        let mut v = serde_json::to_value(entry()).unwrap();
-        v["format"] = serde_json::json!(1);
-        v["service"]["readers"] = serde_json::json!([]);
         assert!(serde_json::from_value::<SignedEntry>(v).is_err());
     }
 

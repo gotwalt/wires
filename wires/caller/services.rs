@@ -225,7 +225,7 @@ fn render_json(entries: &[&SignedEntry], verbose: bool) -> Result<String> {
 struct JsonLine<'a> {
     /// The service's name: what `wires call` takes.
     service: &'a str,
-    /// What it does, from the registry.
+    /// What it does, from the signed policy.
     description: &'a str,
     /// The roles that may call it.
     allow: Vec<&'a str>,

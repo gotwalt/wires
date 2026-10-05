@@ -68,6 +68,7 @@ struct FirstRun {
     root: NodeId,
     network: String,
     workbench: NodeId,
+    workbench_ks: Arc<Keystore>,
     workbench_socks: Vec<std::net::SocketAddr>,
     agent: Agent,
     _serving: tokio::sync::oneshot::Sender<()>,
@@ -89,13 +90,13 @@ async fn edit(
 ) -> (Report, Propagation) {
     let earlier = held_directories(admin).unwrap();
     let report = edit(admin);
-    let root = store::fabric(admin).unwrap().unwrap();
+    let root = admin.network_root().unwrap().unwrap();
     let version = store::read(admin, root).unwrap().unwrap().version();
     let published = publish_current_on(endpoint, admin, &earlier).await;
     (report, settle(admin, published.map(|r| (version, r))))
 }
 
-/// `wires login <network>` on a fresh machine with key `seed`, over `book`:
+/// `wires login <network>` on a fresh machine, over `book`:
 /// join, sign in at the mock IdP (as the network string says), store the
 /// token, and take the view from a directory.
 async fn login(book: &MemoryLookup, idp: &MockIdp, network: &str) -> Agent {
@@ -105,7 +106,9 @@ async fn login(book: &MemoryLookup, idp: &MockIdp, network: &str) -> Agent {
     let me = node.node_id();
     let client = OidcClient::resolve(&LoginArgs::default(), read_settings(&ks)).unwrap();
     assert_eq!(client.issuer, idp.issuer);
-    let fetcher = crate::caller::jwks::KeyFetcher::new(None).unwrap();
+    // As `wires login` builds it: the key cache in the keystore.
+    let fetcher =
+        crate::caller::jwks::KeyFetcher::new(Some(ks.path(crate::caller::jwks::JWKS_DIR))).unwrap();
     let signed_in = run_flow(&fetcher, &client, me, 0, idp.browser(), PATIENCE)
         .await
         .unwrap();
@@ -311,6 +314,7 @@ async fn first_run() -> FirstRun {
         root,
         network,
         workbench,
+        workbench_ks,
         workbench_socks,
         agent,
         _serving: stop,
@@ -332,24 +336,19 @@ async fn first_run() -> FirstRun {
 #[tokio::test]
 async fn the_first_run_works_from_empty_keystores() {
     let run = first_run().await;
-    // The network string is everything a node needed: no file of a badge,
-    // an invite or a ledger anywhere.
-    for ks in [&run.admin, &run.agent.ks] {
-        for gone in [
-            "membership.json",
-            "issued.json",
-            "directories.json",
-            "login.json",
-        ] {
-            assert!(!ks.path(gone).exists(), "{gone}");
-        }
-    }
+    // The network string is everything the agent needed to join.
     assert!(
         run.agent
             .ks
             .path(crate::admin::keystore::NETWORK_FILE)
             .exists()
     );
+    // Every file the three keystores now hold is private (protocol.md §8):
+    // the policy and its lock, the directory's store, the key cache, …
+    #[cfg(unix)]
+    for ks in [&run.admin, &*run.workbench_ks, &run.agent.ks] {
+        crate::testutil::assert_private(&ks.path(""));
+    }
     run.admin_ep.close().await;
 }
 

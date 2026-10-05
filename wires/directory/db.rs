@@ -4,14 +4,14 @@
 //! |---|---|
 //! | `heads` | version → `{head, items}`: the signed head and its items' content hashes, in order (the last [`KEEP_HEADS`] kept, for deltas) |
 //! | `items` | content hash (hex) → the item's JSON (dropped when no kept head names it) |
-//! | `current` | item key (`kind:key`) → content hash, for the newest head |
-//! | `meta` | `version` (the newest head's), `fresh` (the latest [`Fresh`]) |
+//! | `meta` | `version` (the newest head's) |
 //!
 //! One writer ([`DirectoryDb::store`], a publish), many readers. The caller
 //! verifies a policy before storing it; [`DirectoryDb::store`] only keeps
 //! heads strictly increasing, in one transaction, so a crash leaves either
 //! the old head or the new one. A restart reloads the newest head
-//! ([`DirectoryDb::current`]).
+//! ([`DirectoryDb::current`]). A `Fresh` is never stored: a directory
+//! signs a new one when it opens.
 //!
 //! Items are stored by a blake3 hash of their JSON: a storage key only,
 //! independent of how the head commits to them (the signed head is what is
@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use library::{Fresh, Item, SignedPolicy, SignedPolicyHead, StateVersion};
+use library::{Item, SignedPolicy, SignedPolicyHead, StateVersion};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
@@ -34,13 +34,10 @@ pub(crate) const KEEP_HEADS: usize = 16;
 
 const HEADS: TableDefinition<u64, &[u8]> = TableDefinition::new("heads");
 const ITEMS: TableDefinition<&str, &[u8]> = TableDefinition::new("items");
-const CURRENT: TableDefinition<&str, &str> = TableDefinition::new("current");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 /// `meta` key: the newest head's version (8 bytes, big-endian).
 const META_VERSION: &str = "version";
-/// `meta` key: the latest `Fresh` (JSON).
-const META_FRESH: &str = "fresh";
 
 /// A `heads` value: the signed head and its items' storage keys, in order.
 #[derive(Serialize, Deserialize)]
@@ -70,11 +67,12 @@ impl std::fmt::Debug for DirectoryDb {
 impl DirectoryDb {
     /// Open (or create) the store at `path`, with every table present.
     pub(crate) fn open(path: &Path) -> Result<DirectoryDb> {
+        // Made 0600 first: redb would create it with the umask's mode.
+        drop(crate::admin::keystore::open_private(path)?);
         let db = Database::create(path).with_context(|| format!("opening {}", path.display()))?;
         let txn = db.begin_write()?;
         txn.open_table(HEADS)?;
         txn.open_table(ITEMS)?;
-        txn.open_table(CURRENT)?;
         txn.open_table(META)?;
         txn.commit()?;
         Ok(DirectoryDb { db })
@@ -142,7 +140,7 @@ impl DirectoryDb {
     }
 
     /// Store `policy` (already verified) as the newest head, in one
-    /// transaction: its items, its head, the `current` index; then drop the
+    /// transaction: its items and its head; then drop the
     /// heads past [`KEEP_HEADS`] and every item no kept head names. Returns
     /// `false` (storing nothing) unless it is strictly newer than the stored
     /// head.
@@ -174,11 +172,6 @@ impl DirectoryDb {
                 items: keys.clone(),
             })?;
             heads.insert(version.0, record.as_slice())?;
-            let mut current = txn.open_table(CURRENT)?;
-            current.retain(|_, _| false)?;
-            for (item, key) in policy.items.iter().zip(&keys) {
-                current.insert(item.key().to_string().as_str(), key.as_str())?;
-            }
             meta.insert(META_VERSION, version.0.to_be_bytes().as_slice())?;
 
             // Keep the newest KEEP_HEADS heads, and the items they name.
@@ -203,47 +196,12 @@ impl DirectoryDb {
         Ok(true)
     }
 
-    /// The latest `Fresh` stored, if any (a restart signs a new one).
-    #[cfg(test)]
-    pub(crate) fn fresh(&self) -> Result<Option<Fresh>> {
-        let txn = self.db.begin_read()?;
-        let meta = txn.open_table(META)?;
-        match meta.get(META_FRESH)? {
-            Some(v) => Ok(Some(
-                serde_json::from_slice(v.value()).context("a corrupt fresh in directory.redb")?,
-            )),
-            None => Ok(None),
-        }
-    }
-
-    /// Store `fresh` as the latest.
-    pub(crate) fn set_fresh(&self, fresh: &Fresh) -> Result<()> {
-        let bytes = serde_json::to_vec(fresh)?;
-        let txn = self.db.begin_write()?;
-        txn.open_table(META)?.insert(META_FRESH, bytes.as_slice())?;
-        txn.commit()?;
-        Ok(())
-    }
-
     /// How many items the store holds (for tests: garbage collection).
     #[cfg(test)]
     pub(crate) fn item_count(&self) -> Result<u64> {
         use redb::ReadableTableMetadata;
         let txn = self.db.begin_read()?;
         Ok(txn.open_table(ITEMS)?.len()?)
-    }
-
-    /// The `current` index: item key → content hash, for the newest head.
-    #[cfg(test)]
-    pub(crate) fn current_index(&self) -> Result<Vec<(String, String)>> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(CURRENT)?;
-        let mut out = Vec::new();
-        for entry in table.iter()? {
-            let (k, v) = entry?;
-            out.push((k.value().to_string(), v.value().to_string()));
-        }
-        Ok(out)
     }
 }
 
@@ -287,7 +245,6 @@ mod tests {
         let db = db();
         assert_eq!(db.version().unwrap(), StateVersion(0));
         assert!(db.current().unwrap().is_none());
-        assert!(db.fresh().unwrap().is_none());
     }
 
     #[test]
@@ -306,7 +263,6 @@ mod tests {
         let back = db.current().unwrap().unwrap();
         back.verify(root().node_id()).unwrap();
         assert_eq!(back, signed(2, &[5]));
-        assert_eq!(db.current_index().unwrap().len(), back.items.len());
     }
 
     #[test]
@@ -326,27 +282,6 @@ mod tests {
         );
         // One ban item per kept head, plus the one settings item they share.
         assert_eq!(db.item_count().unwrap(), KEEP_HEADS as u64 + 1);
-    }
-
-    #[test]
-    fn the_latest_fresh_survives_a_restart() {
-        let path = crate::testutil::temp_dir().join(DB_FILE);
-        let dir = NodeIdentity::from_seed([30u8; 32]);
-        let mut p = Policy::new(root().node_id());
-        p.version = StateVersion(1);
-        p.not_after = i64::MAX;
-        p.directories = vec![dir.node_id()];
-        let policy = p.sign(&root()).unwrap();
-        let fresh = Fresh::sign(&dir, &policy.head, 10, 20).unwrap();
-        {
-            let db = DirectoryDb::open(&path).unwrap();
-            db.store(&policy).unwrap();
-            db.set_fresh(&fresh).unwrap();
-        }
-        assert_eq!(
-            DirectoryDb::open(&path).unwrap().fresh().unwrap(),
-            Some(fresh)
-        );
     }
 
     proptest! {

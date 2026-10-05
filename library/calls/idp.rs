@@ -9,11 +9,12 @@
 //! *K* authenticated as *alice@corp*".
 //!
 //! Nothing is published. The caller presents the raw ID token in the session
-//! `Hello` of each call (and of each inbox fetch it opens);
-//! the host pairs it with the key iroh authenticated to form an
-//! [`IdentityClaim`], verifies the IdP's signature against the issuer's
-//! published keys **itself** with [`verify_claim`], under the issuers its own
-//! `host.json` trusts, and derives the [`Principal`]. No party has to trust a
+//! `Hello` of each call (and in the hello of each inbox fetch and directory
+//! request it opens); the host pairs it with the key iroh authenticated to
+//! form an [`IdentityClaim`], verifies the IdP's signature against the
+//! issuer's published keys **itself** with [`verify_claim`], under the
+//! issuers the signed policy trusts (which its `host.json` may narrow), and
+//! derives the [`Principal`]. No party has to trust a
 //! wires attestor, and hosts can trust several IdPs at once; every role
 //! matcher names the issuer it accepts.
 //!
@@ -60,8 +61,8 @@ pub const OIDC_NONCE_CONTEXT: &str = "wires oidc-nonce v1";
 pub const CLOCK_SKEW_SECS: i64 = 60;
 
 /// Google's issuer identifier: the one issuer whose `hd` (hosted domain)
-/// claim becomes [`Principal::org`], and the issuer `wires role set` names
-/// when none is given.
+/// claim becomes [`Principal::org`], and `wires init`'s default
+/// `--issuer`.
 pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
 
 /// A raw OIDC ID token: a compact JWS (`header.payload.signature`), exactly as

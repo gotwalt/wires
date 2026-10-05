@@ -2,18 +2,19 @@
 //! (board cards 05 and 27).
 //!
 //! [`Identities`] is the in-memory index `NodeId → latest verified
-//! Principal`. It is fed every ID token a caller presents in person: in the
-//! session [`Hello`](library::Hello) of a call, and in the inbox
-//! [`Hello`](library::InboxFrame::Hello) of a fetch. Each one is verified
-//! here with card 04's [`KeyFetcher`] under
+//! Principal`. It verifies every ID token a caller presents in person: in
+//! the session [`Hello`](library::Hello) of a call, and in the inbox
+//! [`Hello`](library::InboxFrame::Hello) of a fetch, each with card 04's
+//! [`KeyFetcher`] under
 //! the host's trusted issuers ([`IdpTrust`]: the signed policy's `issuer`
 //! items, narrowed by `host.json`; card 36), which follow the policy the
 //! host decides under ([`Identities::set_trust`]). The iroh
 //! connection authenticated the presenting key, and the token's OIDC nonce
 //! binds it to that key, so a token for someone else's key never verifies.
-//! A token that fails is traced and never displaces a principal that
-//! verified, and leaves no entry: any key can present a token (a token is
-//! what admits a caller), so only a signature that verified grows the index.
+//! It indexes a principal only once the gate admitted it
+//! ([`ServicesHost::admit_caller`](crate::host::gate::ServicesHost::admit_caller)):
+//! any key can present a token, so a token that fails, or a person the
+//! policy doesn't admit, leaves no entry and displaces nothing.
 //!
 //! Nothing is broadcast: a host knows the identities of the callers that
 //! have spoken to it, and no others. That is what push authorization reads
@@ -103,8 +104,8 @@ pub(crate) struct Identities {
     fetcher: KeyFetcher,
     /// Which issuers and audiences this host accepts now.
     trust: std::sync::RwLock<IdpTrust>,
-    /// Every node a token whose signature verified was seen from, with the
-    /// verified principal of the latest `exp` (possibly stale by now).
+    /// Every node admitted here, with the verified principal of the latest
+    /// `exp` (possibly stale by now).
     known: Mutex<HashMap<NodeId, Principal>>,
 }
 
@@ -194,7 +195,7 @@ impl Identities {
         }
     }
 
-    /// Every node a token whose signature verified was seen from.
+    /// Every node admitted here.
     pub(crate) fn nodes(&self) -> Vec<NodeId> {
         let known = self.known.lock().expect("identity index poisoned");
         known.keys().copied().collect()

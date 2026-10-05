@@ -1,21 +1,18 @@
 //! Policy evaluation over the signed policy: **may this caller call this
-//! service**, and **which services may it call**.
+//! service**.
 //!
-//! One function, two uses: a host runs [`authorize`] on every call (then its
-//! own stricter `also_require`), and `wires services` runs
-//! [`allowed_services`] locally to list what the caller may use. Both read
-//! only the [`Policy`] (a verified [`SignedPolicy`](crate::SignedPolicy)'s
-//! items) and the caller's verified [`Principal`]; there
-//! is no network and no clock (the principal handed in is already fresh).
+//! A host runs [`authorize`] on every call (then its own stricter
+//! `also_require`). It reads only the [`Policy`] (a verified
+//! [`SignedPolicy`](crate::SignedPolicy)'s items) and the caller's verified
+//! [`Principal`]; there is no network and no clock (the principal handed in
+//! is already fresh). A caller's list of services is its view, which a
+//! directory cuts by the same role rule
+//! ([`SignedPolicy::view_for`](crate::SignedPolicy::view_for)).
 //!
-//! Neither verifies the caller's ID token: that is the gate's, before this,
-//! and so is admission ([`check_admitted`](crate::check_admitted)). Both do
-//! refuse a node or a person the policy bans, so a registry decision never
+//! It doesn't verify the caller's ID token: that is the gate's, before this,
+//! and so is admission ([`check_admitted`](crate::check_admitted)). It does
+//! refuse a node or a person the policy bans, so a policy decision never
 //! admits a removed caller.
-//!
-//! The host is the ground truth: [`allowed_services`] is defined in terms of
-//! [`authorize`], so the listing never shows a service the host would refuse
-//! on registry grounds (a host's `also_require` can still narrow it).
 
 use std::fmt;
 
@@ -24,16 +21,6 @@ use crate::idp::Principal;
 use crate::registry::ServiceName;
 use crate::role::RoleName;
 use crate::signed_policy::Policy;
-
-/// A service the caller may call, and the role that admits it (what `wires
-/// services` shows as "why").
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Grant {
-    /// The service.
-    pub service: ServiceName,
-    /// The first role in the service's `allow` that admits the caller.
-    pub role: RoleName,
-}
 
 /// Why [`authorize`] refused. The `Display` text is for the host's trace, so
 /// each case is precise; a host tells the caller none of them apart (it
@@ -95,7 +82,7 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// Decide one call against the registry, in order: neither `caller` nor the
+/// Decide one call against the policy, in order: neither `caller` nor the
 /// person `principal` is banned →
 /// `service` exists → the first role in its `allow` that admits the caller
 /// (a defined role whose matchers match its verified `principal`; with no
@@ -154,7 +141,7 @@ pub fn authorize(
     if let Some(role) = svc
         .allow
         .iter()
-        .find(|role| role_admits(policy, role, principal))
+        .find(|role| policy.role_admits(role, principal))
     {
         return Ok(role.clone());
     }
@@ -163,36 +150,6 @@ pub fn authorize(
         allow: svc.allow.clone(),
         principal: principal.map(|p| p.email.clone().unwrap_or_else(|| p.subject.clone())),
     })
-}
-
-/// Whether `role` admits a node presenting `principal`: a defined role
-/// when one of its matchers matches the verified principal. With no
-/// principal, no role admits; an undefined role never admits (a validated
-/// policy has none, but a failure here must deny).
-pub fn role_admits(policy: &Policy, role: &RoleName, principal: Option<&Principal>) -> bool {
-    policy.role_admits(role, principal)
-}
-
-/// Every service [`authorize`] would admit `caller` to, with the admitting
-/// role, in name order. Services it can't call are left out, not listed as
-/// refused. A banned node or person gets nothing.
-pub fn allowed_services(
-    policy: &Policy,
-    caller: NodeId,
-    principal: Option<&Principal>,
-) -> Vec<Grant> {
-    policy
-        .services
-        .keys()
-        .filter_map(|service| {
-            authorize(policy, caller, principal, service)
-                .ok()
-                .map(|role| Grant {
-                    service: service.clone(),
-                    role,
-                })
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -335,28 +292,6 @@ mod tests {
             authorize(&policy(), node(2), Some(&alice), &name("orders-db")),
             Err(Refusal::NotInRole { .. })
         ));
-        assert!(allowed_services(&policy(), node(2), Some(&alice)).is_empty());
-    }
-
-    #[test]
-    fn listing_shows_only_what_you_may_call() {
-        let s = policy();
-        let alice = who("alice@example.com");
-        let listed: Vec<_> = allowed_services(&s, node(2), Some(&alice))
-            .into_iter()
-            .map(|g| g.service)
-            .collect();
-        assert_eq!(listed, vec![name("orders-db"), name("status")]);
-        let bob = who("bob@example.com");
-        let listed: Vec<_> = allowed_services(&s, node(3), Some(&bob))
-            .into_iter()
-            .map(|g| g.service)
-            .collect();
-        assert_eq!(listed, vec![name("status")]);
-        assert!(allowed_services(&s, node(3), None).is_empty());
-        assert!(allowed_services(&s, node(9), Some(&alice)).is_empty());
-        // A node the policy never heard of is no different from alice.
-        assert_eq!(allowed_services(&s, node(8), Some(&alice)).len(), 2);
     }
 
     #[test]
@@ -375,7 +310,7 @@ mod tests {
             Ok(staff())
         );
         let ghost = RoleName::new("ghost").unwrap();
-        assert!(!role_admits(&s, &ghost, Some(&alice)));
+        assert!(!s.role_admits(&ghost, Some(&alice)));
     }
 
     #[test]

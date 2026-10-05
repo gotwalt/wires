@@ -553,7 +553,8 @@ async fn a_fresh_from_a_key_not_in_directories_is_refused() {
             &host,
             DirectoryRequest::Policy {
                 have: StateVersion(0)
-            }
+            },
+            now_unix()
         ),
         DirectoryAnswer::Denied { .. }
     ));
@@ -733,7 +734,7 @@ async fn the_first_directory_starts_empty_and_takes_the_first_publish() {
     admin_ep.close().await;
 }
 
-/// `wires directory serve` runs from a joined, listed node's keystore/// `wires directory serve` runs from a joined, listed node's keystore with
+/// `wires directory serve` runs from a joined, listed node's keystore with
 /// no `host.json`, and refuses the admin's keystore and an unlisted node.
 #[test]
 fn directory_serve_needs_a_listed_node_that_is_not_the_admin() {
@@ -895,8 +896,8 @@ async fn first_frame(recv: &mut iroh::endpoint::RecvStream) -> library::SubFrame
     frame
 }
 
-/// `policy` (0: directory, 1: the admin's) with `edit` applied, at the next
-/// version, root-signed.
+/// The policy `dir` holds with `edit` applied, at the next version,
+/// root-signed.
 fn next_policy(
     f: &Fabric,
     dir: &Directory,
@@ -1067,7 +1068,7 @@ async fn a_view_subscription_ends_on_a_ban_and_when_the_directory_is_unlisted() 
     assert!(reason.contains("no longer a directory"), "{reason}");
 }
 
-/// A `hello` is small:/// A `hello` is small: one that announces a publish-sized body is refused
+/// A `hello` is small: one that announces a publish-sized body is refused
 /// from its prefix, before the directory reads (or waits for) the body.
 #[tokio::test]
 async fn a_large_hello_is_refused_before_its_body_is_read() {
@@ -1104,7 +1105,7 @@ async fn a_large_hello_is_refused_before_its_body_is_read() {
 }
 
 /// Peers that connect and never open a stream give up their undecided
-/// slots at the stream deadline, so they can't lock members out.
+/// slots at the stream deadline, so they can't lock admitted callers out.
 #[tokio::test]
 async fn idle_connections_do_not_hold_the_undecided_slots() {
     let f = Fabric::new(2);
@@ -1288,4 +1289,62 @@ fn view() -> DirectoryRequest {
         query: None,
         held: None,
     }
+}
+
+/// Once its head's `not_after` passes, a directory vouches for nothing,
+/// answers nobody and admits nobody under that policy (protocol.md §3: an
+/// expired policy admits nobody and no directory serves it).
+#[tokio::test]
+async fn an_expired_policy_is_served_to_nobody_and_admits_nobody() {
+    let f = Fabric::new(2); // 0: directory, 1: a caller
+    f.list_directory(0);
+    let ks = f.join(0);
+    let now = now_unix();
+    let dir = Directory::open(f.nodes[0].duplicate(), f.root.node_id(), ks, 8, now).unwrap();
+    let short = next_policy(&f, &dir, |p| p.not_after = now + 30);
+    assert!(dir.accept(&short, now).unwrap());
+    let host = Peer {
+        node: f.nodes[1].node_id(),
+        named: true,
+        principal: None,
+    };
+    let policy = || DirectoryRequest::Policy {
+        have: StateVersion(0),
+    };
+    // Before it expires: served, and the caller is admitted.
+    assert!(matches!(
+        dir.answer(&host, policy(), now + 10),
+        DirectoryAnswer::Policy { .. }
+    ));
+    let caller = f.nodes[1].node_id();
+    let token = f.token(1);
+    assert!(dir.admit(caller, token.as_ref(), now + 10).await.admitted());
+    // After: no `Fresh`, no answer, no admission.
+    let later = now + 60;
+    dir.beat(later).unwrap();
+    assert!(dir.snapshot().unwrap().fresh.is_none());
+    assert!(matches!(
+        dir.answer(&host, policy(), later),
+        DirectoryAnswer::Denied { .. }
+    ));
+    assert!(!dir.admit(caller, token.as_ref(), later).await.admitted());
+}
+
+/// A replica peer that goes silent (no policy, no beat) is given up on
+/// after the silence allowance, so the follower reconnects instead of
+/// waiting forever on a half-open stream.
+#[tokio::test]
+async fn a_silent_replica_is_given_up_on() {
+    let f = Fabric::new(1);
+    f.list_directory(0);
+    let ks = f.join(0);
+    let dir = Directory::open(f.nodes[0].duplicate(), f.root.node_id(), ks, 8, now_unix()).unwrap();
+    let (mut ours, _theirs) = tokio::io::duplex(1024);
+    let r = tokio::time::timeout(
+        PATIENCE,
+        super::serve::take_from_replica(&dir, &mut ours, Duration::from_millis(100)),
+    )
+    .await
+    .expect("it gives up on its own");
+    assert!(format!("{:#}", r.unwrap_err()).contains("said nothing"));
 }

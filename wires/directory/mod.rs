@@ -1,4 +1,4 @@
-//! The **directory** role (card 36): where the fabric's policy lives.
+//! The **directory** role (card 36): where the network's policy lives.
 //!
 //! A directory is a node the root-signed head lists in `directories`. It
 //! holds the newest policy (`directory.redb`), signs a freshness timestamp

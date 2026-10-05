@@ -280,7 +280,7 @@ fn consent(urls: &PublicUrls, client: &Client, redirect: &Url, id: &str) -> Resp
     let body = format!(
         "<p><strong>{}</strong>{} wants to run wires services as you.</p>\
          <p>You'll sign in with Google. Each call then runs on the machine that hosts the \
-         service, which checks your identity against the admin-signed list of who may call \
+         service, which checks your identity against the admin-signed policy of who may call \
          what. Access ends when your sign-in expires (about an hour).</p>\
          <p class=\"dim\">Sign-in returns to {}</p>\
          <form method=\"post\" action=\"/authorize/confirm\">\
@@ -462,6 +462,13 @@ pub(crate) async fn callback<B: Backend>(
         }
         Ok((_, tools)) => {
             tracing::info!("gateway: {who} signed in ({} services)", tools.tools.len())
+        }
+        Err(e)
+            if e.downcast_ref::<crate::caller::view::NotAdmitted>()
+                .is_some() =>
+        {
+            tracing::info!("gateway: {who} is not admitted to this network; refused");
+            return back("access_denied", super::NOT_ADMITTED_HERE);
         }
         Err(e) => {
             tracing::warn!("gateway: no view for {who}: {e:#}");

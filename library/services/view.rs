@@ -4,9 +4,9 @@
 //!
 //! A view is the root-signed head (for its version, lifetime and the
 //! directories whose [`Fresh`](crate::Fresh) vouches for it) and the signed
-//! entries of the services a role in whose `allow` admits the caller. Each
-//! entry verifies on its own under the root, so a directory can't
-//! forge one, move one from another fabric, or hand back an older version
+//! entries of the services whose `allow` names a role that admits the
+//! caller. Each entry verifies on its own under the root, so a directory
+//! can't forge one, move one from another network, or hand back an older version
 //! than one the caller holds ([`View::apply`] keeps the newest version of
 //! each entry). What a view leaves out is the point: no role, no ban, and no
 //! service its caller may not use. It is cut by
@@ -130,8 +130,8 @@ impl View {
         }
     }
 
-    /// Apply `update`: its head must verify under `root` and be the same
-    /// fabric's, no older than this one; every removed service must be held
+    /// Apply `update`: its head must verify under `root` and be for the same
+    /// network root, no older than this one; every removed service must be held
     /// and named once; no service may be named twice; a changed entry must
     /// not be older than the one held (a caller keeps the newest version of
     /// each entry); and the result must pass [`verify`](Self::verify). Any

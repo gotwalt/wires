@@ -6,9 +6,11 @@
 //! role only ever admits a caller with a verified principal from that IdP:
 //! there is no built-in role, and no role admits a caller without an
 //! identity. "Anyone signed in with this IdP" is a matcher with only
-//! `issuer`. Role definitions live in the admin-signed
-//! [`Policy`](crate::Policy), so every host and every caller evaluates the same
-//! table.
+//! `issuer`, and a role admits only a principal with a verified email
+//! ([`Policy::role_admits`](crate::Policy::role_admits)), whatever its
+//! matchers say. Role definitions live in the admin-signed
+//! [`Policy`](crate::Policy), so every host and every directory evaluates
+//! the same table (a caller's view holds no roles).
 
 use std::fmt;
 use std::str::FromStr;
@@ -167,8 +169,8 @@ impl fmt::Display for EmailPattern {
 ///
 /// Every matcher names the IdP it trusts, so `*@acme.com` from one issuer is
 /// never satisfied by a token another trusted issuer minted for
-/// `alice@acme.com`. A matcher with only `issuer` admits anyone that IdP
-/// verified. A matcher never matches a caller without a verified principal,
+/// `alice@acme.com`. A matcher with only `issuer` matches anyone that IdP
+/// verified (a role still admits only a verified email). A matcher never matches a caller without a verified principal,
 /// and a matcher whose `issuer` is empty is refused by
 /// [`Policy::validate`](crate::Policy::validate).
 ///

@@ -50,7 +50,7 @@ static STRANGERS: Throttle = Throttle::new();
 /// The longest a replica waits between two attempts to follow a peer.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// `wires/directory/1` as a router protocol. See the module docs.
+/// `wires/directory/2` as a router protocol. See the module docs.
 #[derive(Clone, Debug)]
 pub(crate) struct DirectoryProtocol(pub(crate) Arc<Directory>);
 
@@ -166,7 +166,7 @@ async fn one_request(
                 (Ok(_), None, _) => {
                     refuse("asked for more than a publish without admission".into())
                 }
-                (Ok(request), Some(_slot), _) => dir.answer(&peer, request),
+                (Ok(request), Some(_slot), _) => dir.answer(&peer, request, now_unix()),
                 (Err(e), ..) => {
                     tracing::debug!(peer = %caller.hex(), "unreadable directory request: {e:#}");
                     return Ok(());
@@ -200,7 +200,7 @@ fn admitted(
     Arc::clone(&dir.admitted).try_acquire_owned().ok()
 }
 
-/// `wires/directory-sub/1` as a router protocol. See the module docs.
+/// `wires/directory-sub/2` as a router protocol. See the module docs.
 #[derive(Clone, Debug)]
 pub(crate) struct SubscriptionProtocol(pub(crate) Arc<Directory>);
 
@@ -419,28 +419,50 @@ async fn follow_once(dir: &Directory, endpoint: &Endpoint, peer: NodeId) -> Resu
     };
     wire::write(&mut send, &hello.encode()?).await?;
     wire::write(&mut send, &subscribe.encode()?).await?;
-    let result = async {
-        while let Some(frame) = wire::read_sub_frame(&mut recv).await? {
-            match frame {
-                SubFrame::Policy { policy, fresh } => {
-                    policy.head.verify(dir.root())?;
-                    fresh
-                        .verify(&policy.head)
-                        .context("the replica's freshness doesn't vouch for its head")?;
-                    if policy.version() > dir.version() {
-                        dir.accept(&policy, now_unix())?;
-                    }
-                }
-                SubFrame::Fresh { .. } => {}
-                SubFrame::Denied { reason } => bail!("refused: {reason}"),
-                other => bail!("an unexpected frame for a replica: {other:?}"),
-            }
-        }
-        Ok(())
-    }
-    .await;
+    let result = take_from_replica(dir, &mut recv, replica_silence(dir)).await;
     conn.close(0u32.into(), b"done");
     result
+}
+
+/// How long a replica subscription may stay silent before it is taken for
+/// dead (the peer beats every `settings.beat_secs`): two beats and some
+/// slack, as a host's policy subscription allows.
+fn replica_silence(dir: &Directory) -> Duration {
+    let beat = dir.snapshot().map_or(library::DEFAULT_BEAT_SECS, |c| {
+        c.held.policy.settings.beat_secs
+    });
+    Duration::from_secs(2 * u64::from(beat.max(1)) + 10)
+}
+
+/// Take every newer policy a replica peer sends on `recv`, until it ends,
+/// refuses, or says nothing for `silence` (then the caller reconnects).
+pub(super) async fn take_from_replica<R: tokio::io::AsyncRead + Unpin>(
+    dir: &Directory,
+    recv: &mut R,
+    silence: Duration,
+) -> Result<()> {
+    loop {
+        let frame = tokio::time::timeout(silence, wire::read_sub_frame(recv))
+            .await
+            .map_err(|_| anyhow!("the replica said nothing for {silence:?}"))??;
+        let Some(frame) = frame else {
+            return Ok(());
+        };
+        match frame {
+            SubFrame::Policy { policy, fresh } => {
+                policy.head.verify(dir.root())?;
+                fresh
+                    .verify(&policy.head)
+                    .context("the replica's freshness doesn't vouch for its head")?;
+                if policy.version() > dir.version() {
+                    dir.accept(&policy, now_unix())?;
+                }
+            }
+            SubFrame::Fresh { .. } => {}
+            SubFrame::Denied { reason } => bail!("refused: {reason}"),
+            other => bail!("an unexpected frame for a replica: {other:?}"),
+        }
+    }
 }
 
 /// A directory's loops on an endpoint, stopped when this is dropped (the
