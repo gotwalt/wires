@@ -50,11 +50,10 @@ use library::{IdToken, NodeId, View};
 use url::Url;
 
 use crate::admin::keystore::Keystore;
-use crate::caller::call::{CredArgs, Credentials};
+use crate::caller::call::Credentials;
 use crate::caller::jwks::KeyFetcher;
 use crate::caller::login::{DEFAULT_ISSUER, OidcClient, random_token, save_secret};
-use crate::caller::mcp::with_services;
-use crate::caller::tools::ToolsConfig;
+use crate::caller::mcp::{ViewService, services_in};
 use crate::caller::view::{self, HeldView, ViewWatch};
 
 use self::clients::{ClientKey, MetadataFetcher};
@@ -100,8 +99,8 @@ pub struct GatewayArgs {
     /// Only behind a proxy that sets them: clients can send them too.
     #[arg(long, hide = true)]
     pub trust_proxy_header: bool,
-    /// Dial hosts through this relay instead of n0's (as `wires call
-    /// --relay-url`).
+    /// Dial hosts and directories through this self-hosted relay instead of
+    /// n0's.
     #[arg(long, hide = true)]
     pub relay_url: Option<String>,
 }
@@ -305,13 +304,13 @@ pub(crate) struct PresentingCaller {
 impl crate::caller::call::Caller for PresentingCaller {
     async fn call(
         &self,
-        tool: &crate::caller::tools::RemoteTool,
+        service: &library::ServiceName,
         argv: library::Argv,
         stdin: Vec<u8>,
     ) -> Result<crate::caller::call::CallOutcome> {
         use crate::caller::call::{SERVICE_DIAL_TIMEOUT, ServiceDial, call_entry, outcome};
-        let Some(entry) = self.view.entry(&tool.name) else {
-            bail!("`{}` is not a service this user may call", tool.name);
+        let Some(entry) = self.view.entry(service) else {
+            bail!("`{service}` is not a service this user may call");
         };
         let dial = ServiceDial {
             endpoint: &self.endpoint,
@@ -484,9 +483,12 @@ pub(crate) struct Gateway<B> {
 impl<B: Backend> Gateway<B> {
     /// The web user `session` speaks for: their view, and the MCP tools
     /// the services they may call become.
-    pub(crate) async fn tools_for(&self, session: &Session) -> Result<(Arc<View>, ToolsConfig)> {
+    pub(crate) async fn tools_for(
+        &self,
+        session: &Session,
+    ) -> Result<(Arc<View>, Vec<ViewService>)> {
         let view = self.backend.view(session).await?;
-        let tools = with_services(ToolsConfig::default(), &view);
+        let tools = services_in(&view);
         Ok((view, tools))
     }
 }
@@ -594,10 +596,7 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
         )?,
     };
     let ks = Arc::new(Keystore::resolve()?);
-    let creds = Credentials::resolve(&CredArgs {
-        relay_url: a.relay_url.clone(),
-        ..CredArgs::default()
-    })?;
+    let creds = Credentials::resolve()?.through_relay(a.relay_url.clone());
     let node = creds.node_id();
     // Where web users' views come from: the directories this node knows
     // (its own view's head, else its network string's, else its whole
@@ -745,8 +744,7 @@ pub(crate) mod tests {
                 Some(&principal(email)),
                 None,
             );
-            with_services(ToolsConfig::default(), &view)
-                .tools
+            services_in(&view)
                 .iter()
                 .map(|t| t.name.to_string())
                 .collect()

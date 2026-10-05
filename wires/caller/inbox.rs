@@ -57,8 +57,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::admin::keystore::{self, Keystore};
 use crate::admin::ttl::Ttl;
-use crate::caller::call::CredArgs;
-use crate::caller::lock::{EXIT_LOCKED, Lock};
 use crate::clock::now_ms;
 use crate::host::transport::{self, Denied};
 
@@ -689,29 +687,20 @@ pub(crate) struct InboxArgs {
     /// One JSON object per message instead of a line.
     #[arg(long)]
     pub(crate) json: bool,
-    /// The credential flags `wires call` takes (refused in locked mode).
-    #[command(flatten)]
-    pub(crate) creds: CredArgs,
 }
 
 /// `wires inbox`: fetch from the hosts of this node's services (and, with
 /// `--wait`, accept direct deliveries meanwhile), print what is unread, mark
 /// it read; returns the exit code.
 pub(crate) async fn inbox_cmd(a: InboxArgs) -> Result<i32> {
-    let lock = Lock::detect()?;
-    if let Err(e) = lock.check(&a.creds, None) {
-        eprintln!("wires: {e}");
-        return Ok(EXIT_LOCKED);
-    }
-    let c = &a.creds;
-    let node = keystore::node_identity(c.node_seed.as_deref(), c.node_seed_file.as_deref())?;
     let ks = Arc::new(Keystore::resolve()?);
+    let node = keystore::node_identity_in(&ks)?;
     let root = ks.network_root()?.context(crate::help::NOT_JOINED)?;
     let token = crate::caller::hello::stored_token(&ks)
         .ok_or_else(|| anyhow::anyhow!(crate::help::NOT_SIGNED_IN))?;
     // The hosts asked are the view's: refreshed first when it is stale, as
     // `wires call` does; with no directory answering, the view as it is.
-    if let Err(e) = crate::caller::view::usable(&ks, &node, root, c.relay_url.as_deref()).await {
+    if let Err(e) = crate::caller::view::usable(&ks, &node, root, None).await {
         let holds_view = crate::caller::view::read(&ks, root)
             .ok()
             .flatten()
@@ -727,12 +716,11 @@ pub(crate) async fn inbox_cmd(a: InboxArgs) -> Result<i32> {
         .timeout
         .map(|t| tokio::time::Instant::now() + t.duration());
     let fetcher = Fetcher {
-        endpoint: transport::bind(&node, c.relay_url.as_deref()).await?,
+        endpoint: transport::bind(&node, None).await?,
         hello: hello(token),
         ks: Arc::clone(&ks),
         me: node.node_id(),
         fabric: root,
-        relay: c.relay_url.clone(),
     };
     // Card 37: while waiting, follow the view (so the hosts asked and the
     // hosts admitted follow grants and revocations), and take a host's
@@ -782,8 +770,6 @@ struct Fetcher {
     me: NodeId,
     /// The network root the view verifies under.
     fabric: NodeId,
-    /// The relay to dial through, if any.
-    relay: Option<String>,
 }
 
 impl Fetcher {
@@ -809,7 +795,7 @@ impl Fetcher {
         hosts
             .iter()
             .copied()
-            .zip(hints.targets(&hosts, self.relay.as_deref()))
+            .zip(hints.targets(&hosts, None))
             .collect()
     }
 }
@@ -1118,21 +1104,6 @@ mod tests {
             "--timeout needs --wait"
         );
         assert!(parse(&[]).is_ok());
-    }
-
-    /// Locked mode refuses inbox's credential flags like `call`'s.
-    #[test]
-    fn locked_mode_refuses_inbox_overrides() {
-        let lock = Lock::from_sources(Some("1"), None, false);
-        let a = InboxArgs {
-            creds: CredArgs {
-                relay_url: Some("https://r".into()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(lock.check(&a.creds, None).is_err());
-        assert!(lock.check(&InboxArgs::default().creds, None).is_ok());
     }
 
     #[test]

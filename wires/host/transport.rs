@@ -1117,7 +1117,7 @@ mod tests {
             os("AWS_SECRET_ACCESS_KEY", "s3cr3t"),
             os("GH_TOKEN", "ghp_x"),
             os("WIRES_HOME", "/home/host/.config/wires"),
-            os("WIRES_NODE_SEED", "00"),
+            os("WIRES_LOCKED", "1"),
             os("WIRES_CALLER_NODE", "spoofed"),
         ];
         let service: std::collections::BTreeMap<String, String> = [

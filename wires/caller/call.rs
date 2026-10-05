@@ -12,12 +12,8 @@
 //! head and the service's entry, and the call stops there, **before** any
 //! stdin is sent, unless that entry still lists the host; the caller then
 //! refreshes its view after the call. On an unchanged policy, within a day
-//! of the last refresh, the call is the only connection. A service in the view wins over a `tools.json`
-//! alias of the same name; an alias pins a name to one host (and address
-//! hints), which the view's entry for the alias's service must list, and
-//! that host still decides by its signed policy.
-//! Locked mode ([`crate::caller::lock`]) refuses the override flags a
-//! sandboxed agent could steer this with.
+//! of the last refresh, the call is the only connection. Locked mode
+//! ([`crate::caller::lock`]) refuses a call whose stdin holds data.
 //!
 //! The CLI-native front door. An agent runs `wires call <service> [-- args…]`
 //! from its shell: stdin, stdout and stderr pass straight through, the remote
@@ -32,8 +28,6 @@
 //! ([`dial`]).
 
 use std::future::Future;
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -45,10 +39,9 @@ use library::{
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::admin::keystore::{self, Keystore};
-use crate::caller::lock::{EXIT_LOCKED, Lock, check_process_stdin};
+use crate::caller::lock::{self, EXIT_LOCKED, check_process_stdin};
 use crate::caller::pick::{self, Hints, LastGood};
 use crate::caller::shape::{EXIT_SHAPE, Shape, ShapeArgs, exit_code};
-use crate::caller::tools::{RemoteTool, ToolTarget, ToolsConfig};
 use crate::caller::view::{self, HeldView};
 use crate::host::transport;
 
@@ -72,70 +65,28 @@ pub enum CallOutcome {
     Denied(String),
 }
 
-/// Something that can run a [`RemoteTool`] and hand back its [`CallOutcome`].
+/// Something that can call a service by name and hand back its
+/// [`CallOutcome`].
 ///
 /// `Err` is reserved for local or transport failures (no keystore, dial
 /// timeout, session dropped); a refusal by the host is an `Ok`
 /// [`CallOutcome::Denied`], because to the caller it is an answer.
 pub trait Caller {
-    /// Call `tool` (a service, or an alias) with the extra `argv`, feeding
-    /// it `stdin` (then EOF).
+    /// Call `service` (one in the caller's view; its host is picked at call
+    /// time) with the extra `argv`, feeding it `stdin` (then EOF).
     fn call(
         &self,
-        tool: &RemoteTool,
+        service: &ServiceName,
         argv: Argv,
         stdin: Vec<u8>,
     ) -> impl Future<Output = Result<CallOutcome>> + Send;
 }
 
-/// Everything needed to dial one call, resolved from a [`RemoteTool`] entry.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Dial {
-    /// The pinned host's node id.
-    pub target: NodeId,
-    /// Direct address hints for the host.
-    pub addrs: Vec<SocketAddr>,
-    /// The relay to dial through, if any.
-    pub relay_url: Option<String>,
-    /// The service to ask for plus the per-call argv.
-    pub invocation: Invocation,
-}
-
-impl Dial {
-    /// Resolve the alias `tool` into a dial plan carrying `argv`. The service
-    /// asked for is the entry's explicit `remote_tool`, else the local name.
-    pub fn resolve(tool: &RemoteTool, argv: Argv) -> Result<Self> {
-        let ToolTarget::Node {
-            node,
-            relay_url,
-            addrs,
-        } = &tool.target
-        else {
-            bail!(
-                "`{}` is a service: it resolves to a host at call time",
-                tool.name
-            );
-        };
-        let remote = tool
-            .remote_tool
-            .clone()
-            .unwrap_or_else(|| tool.name.clone());
-        Ok(Self {
-            target: *node,
-            addrs: addrs.clone(),
-            relay_url: relay_url.clone(),
-            invocation: Invocation {
-                service: remote,
-                argv,
-            },
-        })
-    }
-}
-
 /// This node's credentials for dialing: the node key and the network's
 /// root key, plus the ID token to present when it isn't the one `wires
-/// login` stored. The ID token is the only credential: there is nothing the
-/// admin minted for this node.
+/// login` stored (and, for `wires gateway`, a self-hosted relay). The ID
+/// token is the only credential: there is nothing the admin minted for this
+/// node.
 #[derive(Clone)]
 pub struct Credentials {
     node: Arc<NodeIdentity>,
@@ -145,21 +96,24 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    /// Resolve the node key the way `wires serve` does (flag, env, file,
-    /// keystore) and the network from the keystore.
-    pub fn resolve(a: &CredArgs) -> Result<Self> {
-        let root = Keystore::resolve()?
-            .network_root()?
-            .context(crate::help::NOT_JOINED)?;
+    /// The node key and the network, both from the keystore (`$WIRES_HOME`:
+    /// the one way to point a caller at another key).
+    pub fn resolve() -> Result<Self> {
+        let ks = Keystore::resolve()?;
+        let root = ks.network_root()?.context(crate::help::NOT_JOINED)?;
         Ok(Self {
-            node: Arc::new(keystore::node_identity(
-                a.node_seed.as_deref(),
-                a.node_seed_file.as_deref(),
-            )?),
+            node: Arc::new(keystore::node_identity_in(&ks)?),
             root,
-            relay_override: a.relay_url.clone(),
+            relay_override: None,
             id_token: None,
         })
+    }
+
+    /// Dial through the self-hosted relay at `url` instead of n0's (`wires
+    /// gateway --relay-url`; a caller's own commands take no relay).
+    pub fn through_relay(mut self, url: Option<String>) -> Self {
+        self.relay_override = url;
+        self
     }
 
     /// Credentials for `node` in the network rooted at `root`, from no flags
@@ -189,7 +143,7 @@ impl Credentials {
         self.node.node_id()
     }
 
-    /// The `--relay-url` override, if any.
+    /// The [`through_relay`](Self::through_relay) relay, if any.
     pub(crate) fn relay(&self) -> Option<&str> {
         self.relay_override.as_deref()
     }
@@ -207,8 +161,9 @@ impl Credentials {
             .or_else(|| crate::caller::hello::stored_token(ks))
     }
 
-    /// Bind this node's endpoint (through the `--relay-url` override, if
-    /// any), for dialing services.
+    /// Bind this node's endpoint (through the
+    /// [`through_relay`](Self::through_relay) relay, if any), for dialing
+    /// services.
     pub(crate) async fn bind(&self) -> Result<iroh::Endpoint> {
         transport::bind(&self.node, self.relay_override.as_deref()).await
     }
@@ -231,51 +186,6 @@ impl Credentials {
     }
 }
 
-/// Dial `plan` (an alias: one pinned host) with `creds` and bridge the given
-/// stdio; returns the remote exit code. The session opens with the same
-/// [`Hello`] a service call does, so the host still decides
-/// by its signed policy. A refusal surfaces as a [`transport::Denied`] error.
-///
-/// Refuses, before dialing, a node with no ID token, an expired view, or a
-/// pinned host the view's entry for the alias's service doesn't list.
-pub async fn dial<R, W, E>(
-    creds: &Credentials,
-    plan: Dial,
-    stdin: R,
-    stdout: W,
-    stderr: E,
-) -> Result<i32>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin,
-    E: AsyncWrite + Unpin,
-{
-    let ks = Keystore::resolve()?;
-    let held = usable_view(&ks, creds).await?;
-    let hello = creds.hello(&ks, held.version())?;
-    check_alias(&held, &plan)?;
-    let service = plan.invocation.service.clone();
-    let relay = creds.relay_override.clone().or(plan.relay_url);
-    let target = transport::endpoint_addr(&plan.target, &plan.addrs, relay.as_deref())?;
-    let endpoint = transport::bind(&creds.node, relay.as_deref()).await?;
-    let fabric = creds.root;
-    let held_version = held.version();
-    let done = transport::call_service_on(
-        &endpoint,
-        &[target],
-        SERVICE_DIAL_TIMEOUT,
-        hello,
-        plan.invocation,
-        |host, ack| accept_ack(fabric, held_version, &service, host, ack),
-        stdin,
-        stdout,
-        stderr,
-    )
-    .await;
-    endpoint.close().await;
-    Ok(done?.dialed.exit)
-}
-
 /// The live [`Caller`]: dials over wires with this node's [`Credentials`],
 /// from the view in its keystore (which `wires mcp`'s subscription keeps
 /// current, so a call needs no refresh after it).
@@ -293,8 +203,8 @@ impl WiresCaller {
 impl Caller for WiresCaller {
     /// A host's `NOT_ADMITTED` comes back as what this caller's person can
     /// act on ([`explain_not_admitted`](crate::caller::hello::explain_not_admitted)).
-    async fn call(&self, tool: &RemoteTool, argv: Argv, stdin: Vec<u8>) -> Result<CallOutcome> {
-        let outcome = self.call_as_is(tool, argv, stdin).await?;
+    async fn call(&self, service: &ServiceName, argv: Argv, stdin: Vec<u8>) -> Result<CallOutcome> {
+        let outcome = self.call_as_is(service, argv, stdin).await?;
         Ok(match outcome {
             CallOutcome::Denied(reason) => CallOutcome::Denied(match Keystore::resolve() {
                 Ok(ks) => crate::caller::hello::say_refusal(&ks, &reason),
@@ -309,40 +219,28 @@ impl WiresCaller {
     /// [`Caller::call`], with the host's refusal as it said it.
     async fn call_as_is(
         &self,
-        tool: &RemoteTool,
+        service: &ServiceName,
         argv: Argv,
         stdin: Vec<u8>,
     ) -> Result<CallOutcome> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        if tool.target == ToolTarget::Service {
-            let result = async {
-                let ks = Keystore::resolve()?;
-                let held = usable_view(&ks, &self.creds).await?;
-                call_service(
-                    &self.creds,
-                    &ks,
-                    &held,
-                    &tool.name,
-                    argv,
-                    std::io::Cursor::new(stdin),
-                    &mut stdout,
-                    &mut stderr,
-                    CallOpts::default(),
-                )
-                .await
-            }
-            .await;
-            return outcome(result, stdout, stderr);
+        let result = async {
+            let ks = Keystore::resolve()?;
+            let held = usable_view(&ks, &self.creds).await?;
+            call_service(
+                &self.creds,
+                &ks,
+                &held,
+                service,
+                argv,
+                std::io::Cursor::new(stdin),
+                &mut stdout,
+                &mut stderr,
+                CallOpts::default(),
+            )
+            .await
         }
-        let plan = Dial::resolve(tool, argv)?;
-        let result = dial(
-            &self.creds,
-            plan,
-            std::io::Cursor::new(stdin),
-            &mut stdout,
-            &mut stderr,
-        )
         .await;
         outcome(result, stdout, stderr)
     }
@@ -382,24 +280,6 @@ pub(crate) fn outcome(
 pub(crate) async fn usable_view(ks: &Keystore, creds: &Credentials) -> Result<HeldView> {
     creds.require_token(ks)?;
     view::usable(ks, &creds.node, creds.root, creds.relay()).await
-}
-
-/// An alias may only pin a host that the view's entry for the alias's
-/// service (its `remote_tool`, else its name) lists.
-fn check_alias(held: &HeldView, plan: &Dial) -> Result<()> {
-    let service = plan.invocation.service.clone();
-    let listed = held
-        .entry(&service)
-        .is_some_and(|e| e.service.hosts.contains(&plan.target));
-    if !listed {
-        bail!(
-            "the alias's host {} is not assigned `{service}` in your view (policy version {}); \
-             nothing was dialed",
-            plan.target.short(),
-            held.version().0
-        );
-    }
-    Ok(())
 }
 
 /// What the caller does at a host's `HelloAck`, before any stdin: when the
@@ -460,7 +340,7 @@ pub(crate) struct CallOpts {
 /// failure, the [`Hello`], the ack check ([`accept_ack`]), stdio, and the
 /// host that answered remembered. With [`CallOpts::refresh_after`], a newer
 /// head a host reported is followed by a view refresh. A refusal is a
-/// [`transport::Denied`] error, as in [`dial`].
+/// [`transport::Denied`] error.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_service<R, W, E>(
     creds: &Credentials,
@@ -667,34 +547,9 @@ where
     })
 }
 
-/// Credential flags shared by `wires call`, `wires mcp` and `wires inbox`,
-/// hidden from `--help` (listed by `--help-all`): a caller never needs them.
-///
-/// Every one of them is refused in locked mode (`WIRES_LOCKED=1`, see
-/// [`crate::caller::lock`]), as is `--tools-file`: they are how a caller is
-/// steered off the operator's configuration.
-#[derive(Args, Clone, Debug, Default)]
-pub struct CredArgs {
-    /// Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`,
-    /// then `--node-seed-file`, then the keystore (`node.seed`).
-    #[arg(long, hide = true)]
-    pub node_seed: Option<String>,
-    /// Read the node key seed (hex) from this file instead of the keystore.
-    #[arg(long, hide = true)]
-    pub node_seed_file: Option<PathBuf>,
-    /// Dial through this relay, overriding an alias's own.
-    #[arg(long, hide = true)]
-    pub relay_url: Option<String>,
-}
-
 /// `wires call <service> [--jq F] [--head N] [--max-bytes N] [-- args…]`.
 #[derive(Args)]
 pub struct CallArgs {
-    #[command(flatten)]
-    pub creds: CredArgs,
-    /// Read aliases from this file instead of `$WIRES_HOME/tools.json`.
-    #[arg(long, hide = true)]
-    pub tools_file: Option<PathBuf>,
     // Local output shaping (no shell needed). Goes before `--`, after the
     // service name (so a permission rule scoped to the service, e.g.
     // `Bash(wires call gh:*)`, still matches) or before it.
@@ -711,20 +566,6 @@ pub struct CallArgs {
     pub args: Vec<String>,
 }
 
-/// Look the alias `name` up in `config`, with an error that lists what *is*
-/// there.
-pub fn lookup<'a>(config: &'a ToolsConfig, name: &str) -> Result<&'a RemoteTool> {
-    let found = ServiceName::new(name).ok().and_then(|n| config.get(&n));
-    found.ok_or_else(|| {
-        let known: Vec<&str> = config.tools.iter().map(|t| t.name.as_str()).collect();
-        if known.is_empty() {
-            anyhow!("no alias named `{name}`: tools.json is empty (add one with `wires tools add`)")
-        } else {
-            anyhow!("no alias named `{name}` (known: {})", known.join(", "))
-        }
-    })
-}
-
 /// `wires call`: stream local stdio to the remote service; returns its exit
 /// code.
 ///
@@ -736,14 +577,9 @@ pub fn lookup<'a>(config: &'a ToolsConfig, name: &str) -> Result<&'a RemoteTool>
 /// The shaping flags are local: they are not part of the [`Invocation`], so
 /// the host never sees them: it gets only `(service, argv)`.
 ///
-/// In locked mode ([`Lock`]), an override flag, or data on stdin the operator
-/// didn't allow, fails with [`EXIT_LOCKED`] before anything is dialed.
+/// In locked mode ([`crate::caller::lock`]), data on stdin fails with
+/// [`EXIT_LOCKED`] before anything is dialed.
 pub async fn call_cmd(a: CallArgs) -> Result<i32> {
-    let lock = Lock::detect()?;
-    if let Err(e) = lock.check(&a.creds, a.tools_file.as_deref()) {
-        eprintln!("wires: {e}");
-        return Ok(EXIT_LOCKED);
-    }
     let shape = match Shape::new(&a.shape) {
         Ok(shape) => shape,
         Err(e) => {
@@ -751,7 +587,7 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
             return Ok(EXIT_SHAPE);
         }
     };
-    let stdin: Box<dyn AsyncRead + Unpin + Send> = if lock.refuses_stdin() {
+    let stdin: Box<dyn AsyncRead + Unpin + Send> = if lock::detect() {
         if let Err(e) = check_process_stdin().await {
             eprintln!("wires: {e}");
             return Ok(EXIT_LOCKED);
@@ -760,33 +596,27 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
     } else {
         Box::new(tokio::io::stdin())
     };
-    let config = ToolsConfig::load(&crate::caller::tools::resolve_path(
-        a.tools_file.as_deref(),
-    )?)?;
+    let service = ServiceName::new(&a.service).map_err(|e| anyhow!("`{}`: {e}", a.service))?;
     let argv = Argv::new(a.args).context("arguments")?;
-    let creds = Credentials::resolve(&a.creds)?;
+    let creds = Credentials::resolve()?;
     let ks = Keystore::resolve()?;
     let held = usable_view(&ks, &creds).await?;
-    let route = route_in(&config, &a.service, argv, &held)?;
-    let run = async |stdout: &mut (dyn AsyncWrite + Unpin + Send)| match route {
-        Route::Service { service, argv } => {
-            call_service(
-                &creds,
-                &ks,
-                &held,
-                &service,
-                argv,
-                stdin,
-                stdout,
-                tokio::io::stderr(),
-                CallOpts {
-                    verbose: a.verbose,
-                    refresh_after: true,
-                },
-            )
-            .await
-        }
-        Route::Alias(plan) => dial(&creds, plan, stdin, stdout, tokio::io::stderr()).await,
+    let run = async |stdout: &mut (dyn AsyncWrite + Unpin + Send)| {
+        call_service(
+            &creds,
+            &ks,
+            &held,
+            &service,
+            argv,
+            stdin,
+            stdout,
+            tokio::io::stderr(),
+            CallOpts {
+                verbose: a.verbose,
+                refresh_after: true,
+            },
+        )
+        .await
     };
     let report = |remote: i32| {
         let (code, note) = own_exit(remote);
@@ -808,41 +638,6 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
         tokio::io::stderr(),
     )
     .await
-}
-
-/// Where `wires call <name>` goes.
-#[derive(Debug)]
-enum Route {
-    /// A service: in the view, or to be resolved by a directory.
-    Service {
-        /// The service.
-        service: ServiceName,
-        /// The per-call arguments.
-        argv: Argv,
-    },
-    /// An alias in `tools.json`, resolved to its pinned host.
-    Alias(Dial),
-}
-
-/// A service in the view wins; else an alias (whose host [`dial`] checks
-/// against the view); else a service name the view doesn't hold, which
-/// [`call_service`] asks a directory about. A name that is none of these is
-/// an error.
-fn route_in(config: &ToolsConfig, name: &str, argv: Argv, held: &HeldView) -> Result<Route> {
-    let service = ServiceName::new(name).ok();
-    if let Some(service) = &service
-        && held.entry(service).is_some()
-    {
-        return Ok(Route::Service {
-            service: service.clone(),
-            argv,
-        });
-    }
-    if let Ok(alias) = lookup(config, name) {
-        return Ok(Route::Alias(Dial::resolve(alias, argv)?));
-    }
-    let service = ServiceName::new(name).map_err(|e| anyhow!("`{name}`: {e}"))?;
-    Ok(Route::Service { service, argv })
 }
 
 /// Shape a finished call's `stdout`, write it to `out` and any notes to
@@ -875,52 +670,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use library::SignedPolicy;
-
-    fn tool(target: ToolTarget, remote: Option<&str>) -> RemoteTool {
-        RemoteTool {
-            name: ServiceName::new("local").unwrap(),
-            description: String::new(),
-            target,
-            remote_tool: remote.map(|r| ServiceName::new(r).unwrap()),
-        }
-    }
-
-    fn node() -> NodeId {
-        NodeIdentity::from_seed([9; 32]).node_id()
-    }
-
-    #[test]
-    fn node_target_keeps_the_local_name() {
-        let addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
-        let t = tool(
-            ToolTarget::Node {
-                node: node(),
-                relay_url: Some("https://relay.example".into()),
-                addrs: vec![addr],
-            },
-            None,
-        );
-        let d = Dial::resolve(&t, Argv::new(vec!["x".into()]).unwrap()).unwrap();
-        assert_eq!(d.target, node());
-        assert_eq!(d.addrs, vec![addr]);
-        assert_eq!(d.relay_url.as_deref(), Some("https://relay.example"));
-        assert_eq!(d.invocation.service.as_str(), "local");
-        assert_eq!(d.invocation.argv.as_slice(), ["x"]);
-    }
-
-    #[test]
-    fn explicit_remote_name_wins_over_the_local_name() {
-        let t = tool(
-            ToolTarget::Node {
-                node: node(),
-                relay_url: None,
-                addrs: vec![],
-            },
-            Some("psql"),
-        );
-        let d = Dial::resolve(&t, Argv::default()).unwrap();
-        assert_eq!(d.invocation.service.as_str(), "psql");
-    }
+    use std::net::SocketAddr;
 
     #[test]
     fn denied_is_an_outcome_and_other_errors_stay_errors() {
@@ -939,28 +689,6 @@ mod tests {
                 stderr: b"e".to_vec()
             }
         );
-    }
-
-    #[test]
-    fn lookup_lists_known_aliases_on_a_miss() {
-        let config = ToolsConfig {
-            tools: vec![tool(
-                ToolTarget::Node {
-                    node: node(),
-                    relay_url: None,
-                    addrs: vec![],
-                },
-                None,
-            )],
-            locked: false,
-        };
-        assert!(lookup(&config, "local").is_ok());
-        let err = lookup(&config, "nope").unwrap_err().to_string();
-        assert!(err.contains("known: local"), "{err}");
-        let err = lookup(&ToolsConfig::default(), "nope")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("tools.json is empty"), "{err}");
     }
 
     /// A stand-in CLI so `CallArgs` parsing can be tested on its own.
@@ -1169,9 +897,10 @@ mod tests {
         );
         let a = parse(&["rg", "--", "-n", "--x", "foo"]);
         assert_eq!(a.args, ["-n", "--x", "foo"]);
-        let a = parse(&["--tools-file", "/t.json", "rg", "-n"]);
-        assert_eq!(a.tools_file, Some(PathBuf::from("/t.json")));
-        assert_eq!(a.args, ["-n"]);
+        // A flag `wires call` doesn't take, after the service name, is the
+        // service's own argument.
+        let a = parse(&["rg", "--relay-url", "x"]);
+        assert_eq!(a.args, ["--relay-url", "x"]);
         assert!(parse(&["rg"]).args.is_empty());
     }
 
@@ -1695,47 +1424,6 @@ mod tests {
             asked.0.load(Ordering::SeqCst) >= 1,
             "a newer head: the view is refreshed after the call"
         );
-    }
-
-    /// Card 28 §8, card 37: a service in the view beats an alias of the same
-    /// name, and an alias may only pin a host the view's entry lists.
-    #[test]
-    fn a_service_beats_an_alias_and_an_alias_needs_an_assigned_host() {
-        let f = fixture();
-        let host = NodeIdentity::from_seed([90; 32]).node_id();
-        let stranger = NodeIdentity::from_seed([91; 32]).node_id();
-        let state = held(&f, &signed_at(&f.root, 1, &[host]));
-        let alias = |name: &str, node: NodeId| RemoteTool {
-            name: ServiceName::new(name).unwrap(),
-            description: String::new(),
-            target: ToolTarget::Node {
-                node,
-                relay_url: None,
-                addrs: vec![],
-            },
-            remote_tool: Some(ServiceName::new("orders-db").unwrap()),
-        };
-        let config = ToolsConfig {
-            tools: vec![alias("orders-db", stranger), alias("orders", stranger)],
-            locked: false,
-        };
-        let route = |name| route_in(&config, name, Argv::default(), &state);
-        let routed = route("orders-db").unwrap();
-        assert!(matches!(routed, Route::Service { .. }), "the service wins");
-        let Route::Alias(plan) = route("orders").unwrap() else {
-            panic!("an alias")
-        };
-        assert_eq!(plan.target, stranger);
-        // A name that is neither: a service to resolve at call time.
-        assert!(matches!(route("nope").unwrap(), Route::Service { .. }));
-        assert!(route("Not A Name").is_err());
-
-        let plan = |node| Dial::resolve(&alias("orders", node), Argv::default()).unwrap();
-        let err = check_alias(&state, &plan(stranger))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not assigned `orders-db`"), "{err}");
-        check_alias(&state, &plan(host)).unwrap();
     }
 
     /// Card 28 §10: a remote exit 77 is not a refusal.

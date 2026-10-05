@@ -632,7 +632,7 @@ and a handler wanting a stricter local rule checks `Call::role` or `Call::princi
 embedded host starts like `serve`: its keystore must have joined a network (`network.json`), the
 signed policy must assign every service to it, CLI and native, and a name can't be both (`build`
 refuses it). Its keystore, hints file included, is the
-directory the app names; it reads neither `$WIRES_HOME` nor `$WIRES_NODE_SEED`. `serve_until`
+directory the app names; it never reads `$WIRES_HOME`. `serve_until`
 returns once its shutdown future resolves and everything it started has stopped: the policy
 subscription, the directory's loops (when it runs one), the protocol router with its sessions, and the
 endpoint (closed). `Host::serve` is
@@ -692,14 +692,9 @@ first.
 Exit codes: `Denied` → **77**, nothing on stdout. Local or transport failure (including the checks
 above) → 1. Otherwise the remote exit code, **except that a remote 77 is reported as 1** with a
 note on stderr, so 77 always means the host refused. `wires call` exits 2 before dialing when its `--jq` filter
-doesn't compile or locked mode refuses, and 2 when the remote exited 0 but shaping its output
+doesn't compile or locked mode refuses its stdin, and 2 when the remote exited 0 but shaping its output
 failed. A session that ends without `Exit` is an error. Limits: 16 MiB largest frame once admitted (64 KiB `Hello` and 512 KiB `Invoke`
 before); `Argv` holds at most 256 arguments and 64 KiB.
-
-A `tools.json` alias pins a local name to one host (node id, optional addresses and relay) and,
-optionally, the service to ask for (`remote_tool`, else the local name); it opens the same `Hello`, so the host still decides by its policy. A
-service in the caller's view wins over an alias of the same name, and an alias is refused before
-dialing unless the view's entry for that service lists its host.
 
 ## 6. Identity
 
@@ -844,7 +839,6 @@ reaches `wires mcp` and the gateway.
 | `idp-token.jwt`, `idp-refresh-token` | 0600 | caller | from `wires login` |
 | `last-good.json` | 0600 | caller | service → the host that last answered |
 | `hints` | — (the operator's; wires never writes it) | any node | optional local dial hints (below) |
-| `tools.json` | — | caller | locked mode; optional aliases |
 | `inbox/` | 0700 | caller | `new/` (≤256 unread), `read/` (last 1024), `notes/` |
 | `push-queue.json` | — | host | §7 |
 | `gateway-client-key`, `gateway-sessions.json` | 0600 | web gateway | the key DCR client ids are MAC'd with; live web sessions keyed by token hash |
@@ -866,8 +860,8 @@ explicit `duplicate()`; the raw seed comes out only through `expose_seed()`/`exp
 copies scrubbed on drop. Reading `node.seed` and writing it both go through scrubbed buffers. This
 guards against accidents in safe Rust, not against code in the same process: `unsafe` code, a
 foreign-language runtime, a debugger running as the same user, or a core dump can read the key.
-Rust moves can also leave stale stack copies that nothing scrubs. A seed passed by flag or
-environment variable also stays in the process's argv or environment.
+Rust moves can also leave stale stack copies that nothing scrubs. A seed passed by `--node-seed`
+also stays in the process's argv.
 
 **Hints** (`wires/caller/pick.rs`). `$WIRES_HOME/hints` is local and unsigned: one line per node,
 `<node id hex> <ip:port>…`, `#` comments, bad lines skipped. Every endpoint `wires` binds registers
@@ -879,10 +873,13 @@ Every file wires writes above is written atomically: a temporary file created `O
 overwritten). A file with no listed mode is 0600. A keystore directory wires creates is 0700 (an
 existing one is left as it is). `directory.redb` is redb's own file, created 0600.
 
-Flags, environment variables and `--…-file` paths override the keystore, in that order of
-precedence. Locked mode (`WIRES_LOCKED`) refuses the credential flags, `--tools-file` and the `WIRES_NODE_SEED`
-variable, and, for `wires call`, data on stdin unless `WIRES_LOCKED_STDIN=allow` (exit 2); it assumes the agent can't
-set its own environment.
+`$WIRES_HOME` is the one way to point `wires` at another keystore. A caller's commands (`login`,
+`services`, `call`, `mcp`, `inbox`) take no key, relay or config flag: they use the keystore's node
+key and n0's relays. `serve` alone takes its node key ahead of the keystore (`--node-seed-file`,
+or `--node-seed`), for a container that mounts its key; `serve`, `directory serve` and `gateway`
+take `--relay-url` for a self-hosted relay. Locked mode (`WIRES_LOCKED`, set by the operator)
+refuses a `wires call` whose stdin holds data, before dialing (exit 2): stdin can carry local files
+to the host. It assumes the agent can't set its own environment.
 
 ## 9. Known limits
 

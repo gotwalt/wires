@@ -31,8 +31,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use super::{PATIENCE, bind_in, localhost_socks, role, service};
 use crate::admin::keystore::Keystore;
 use crate::caller::login::ID_TOKEN_FILE;
-use crate::caller::mcp::{LIST_CHANGED, McpServer, serve_following, with_services};
-use crate::caller::tools::ToolsConfig;
+use crate::caller::mcp::{LIST_CHANGED, McpServer, serve_following, services_in};
 use crate::caller::view::{self, Asker, Follow, HeldView};
 use crate::clock::now_unix;
 use crate::directory::node::Directory;
@@ -306,7 +305,7 @@ async fn a_grant_and_a_revocation_reach_a_running_mcp_within_2s() {
         .unwrap()
         .clone()
         .unwrap();
-    let tools = |held: &HeldView| with_services(ToolsConfig::default(), &held.view);
+    let tools = |held: &HeldView| services_in(&held.view);
     let (tools_tx, tools_rx) = tokio::sync::watch::channel(tools(&first));
     let mapper = tokio::spawn(async move {
         while views.changed().await.is_ok() {
@@ -696,7 +695,7 @@ struct NoCalls;
 impl crate::caller::call::Caller for NoCalls {
     async fn call(
         &self,
-        _tool: &crate::caller::tools::RemoteTool,
+        _service: &library::ServiceName,
         _argv: library::Argv,
         _stdin: Vec<u8>,
     ) -> anyhow::Result<crate::caller::call::CallOutcome> {

@@ -80,8 +80,8 @@ In order of how much it relies on Claude Code's command parser:
 
 1. **`wires mcp` as the boundary (no shell at all).** Give the agent no
    `Bash` tool: `--tools=` (plus `ToolSearch` if tool search is wanted) and
-   `--allowedTools=mcp__wires`, with `wires mcp` in the MCP config and
-   `WIRES_LOCKED=1` in that server's `env`. The permission surface is then
+   `--allowedTools=mcp__wires`, with `wires mcp` in the MCP config (locked
+   mode has nothing to refuse there). The permission surface is then
    exactly the services the signed policy lets you call, as with any MCP
    server. The `jq` / `head` / `max_bytes` fields give it the same
    in-process filtering as `wires call`. The benchmark measured the CLI path
@@ -94,11 +94,9 @@ In order of how much it relies on Claude Code's command parser:
    - `WIRES_LOCKED=1` in the agent's environment (the probe below: Claude
      Code refuses `WIRES_LOCKED=0 wires call …`, `env -u`, `unset` and
      `export` under this rule);
-   - `$WIRES_HOME/tools.json` owned by the operator and read-only to the
-     agent's user, optionally with `"locked": true` in it so the lock holds
-     even if the environment is lost. `wires` still writes its own files
-     (`view.json`, `last-good.json`, `inbox/`) under `$WIRES_HOME`, so
-     only the config and credential files need to be read-only.
+   - `node.seed` and `network.json` under `$WIRES_HOME` read-only to the
+     agent's user. `wires` still writes its own files (`view.json`,
+     `last-good.json`, `idp-token.jwt`, `inbox/`) there.
 
    There, `cat` and friends don't exist: a probe showed Claude Code refuses
    absolute-path binaries like `/bin/cat`, and a bare `cat` would just fail
@@ -114,28 +112,23 @@ In order of how much it relies on Claude Code's command parser:
 
 ## Locked caller mode (card 20)
 
-Without the lock, the agent controls **`wires call`'s own flags** under any
-`Bash(wires call…)` rule: `--tools-file`, `--node-seed`, `--node-seed-file`
-and `--relay-url`. With them it could point the
-caller at another tools map or relay, present another key, or feed a local
-file in as a credential (an unlocked `--tools-file canary.txt` reads the
-file: `wires: parsing canary.txt: …`).
+`wires call`, `wires mcp` and `wires inbox` take no flag that points them at
+another key, relay or config (card 44 removed `--tools-file`,
+`--node-seed[-file]` and `--relay-url` from them, and `$WIRES_NODE_SEED`):
+the keystore `$WIRES_HOME` names is the only one they use. What the agent
+still controls under a `Bash(wires call…)` rule is the call's stdin, so that
+is all the lock refuses. The operator turns it on with `WIRES_LOCKED=1` (any
+value but empty, `0`, `false`, `no` or `off`). Then:
 
-The operator turns the lock on with `WIRES_LOCKED=1` (any value but empty,
-`0`, `false`, `no` or `off`) or `"locked": true` in `$WIRES_HOME/tools.json`
-(only that file is consulted, never a `--tools-file`). Then:
-
-| | locked `wires call` | locked `wires mcp` |
+| | locked `wires call` | `wires mcp` |
 |---|---|---|
-| the four flags above | **refused**, exit 2, `wires: --relay-url is not allowed in locked mode …`; nothing dialed | refused at startup, exit 1 |
-| `--jq`, `--head`, `--max-bytes`, `--verbose`, the service name (`db_query`), its args after `--` (including ones spelled like our flags) | accepted | the `jq` / `head` / `max_bytes` / `args` fields: accepted |
-| stdin | **refused if it holds any data** (exit 2), unless the operator also sets `WIRES_LOCKED_STDIN=allow`; a terminal or empty stdin is fine, and the remote gets EOF | the `stdin` field: accepted |
-| `WIRES_NODE_SEED` (it overrides the node key, like the flags) | **refused**, exit 2, `wires: $WIRES_NODE_SEED is not allowed in locked mode …`; nothing dialed | refused at startup, exit 1 |
-| `WIRES_HOME`, `WIRES_LOCKED`, `WIRES_LOCKED_STDIN` | still read: they are how the operator configures the lock | same |
+| `--jq`, `--head`, `--max-bytes`, `--verbose`, the service name (`db_query`), its args after `--` (including ones spelled like flags) | accepted | the `jq` / `head` / `max_bytes` / `args` fields: accepted |
+| stdin | **refused if it holds any data**, exit 2, nothing dialed; a terminal or empty stdin is fine, and the remote gets EOF | the `stdin` field: accepted |
+| `WIRES_HOME`, `WIRES_LOCKED` | read: they are how the operator configures the caller | `WIRES_HOME` read |
 
 **Locked mode assumes the agent can't set its own environment.** `WIRES_LOCKED`
-turns the lock on, and `WIRES_HOME` chooses the keystore and the `tools.json`
-whose `"locked"` is read, so an agent that can run `WIRES_LOCKED=0 wires call …`
+turns the lock on, and `WIRES_HOME` chooses the keystore, so an agent that can
+run `WIRES_LOCKED=0 wires call …`
 or `WIRES_HOME=./mine wires call …` is not locked. Set them where the agent
 can't change them (the MCP server's `env`, the sandbox's own environment) and
 keep the agent's permission rules from allowing an environment prefix, `env`,
@@ -152,43 +145,40 @@ an argument (`wires call db_query -- 'select …'`), which is also what the MCP
 schema teaches. On the MCP path, `stdin` is a string inside
 the client's JSON-RPC request, the model's own text; `wires mcp` never reads
 a file for it, so nothing local can ride along, and MCP clients that send SQL
-that way keep working. Operators whose tools genuinely need piped input set
-`WIRES_LOCKED_STDIN=allow` and accept the `< file` path.
+that way keep working. Operators whose services genuinely need piped input
+leave the lock off and accept the `< file` path.
 
-**Probe re-run (2026-09-23, Claude Code 2.1.280, Haiku, real `wires`
-binary with an empty scratch `WIRES_HOME`, so nothing was dialed).** Raw rows:
-`bench/results/permission-probe-locked.jsonl` (31 sessions, $0.18).
+**Probe (2026-09-23, Claude Code 2.1.280, Haiku, real `wires` binary with
+an empty scratch `WIRES_HOME`, so nothing was dialed).** Raw rows:
+`bench/results/permission-probe-locked.jsonl` (31 sessions, $0.18). The rows
+below are the ones that still apply; the raw rows also probe the flags card 44
+removed, and the five unlock attempts were made with a `--tools-file` payload
+(Claude Code refused them on the environment change, before `wires` ran, so the
+payload didn't matter). `bench/permission-probe.py` now probes with
+`< canary.txt` instead; it has not been re-run since.
 
 | probe (`Bash(wires call:*)`) | unlocked | `WIRES_LOCKED=1` |
 |---|---|---|
-| `--tools-file canary.txt` | honored (file parsed) | **refused** by wires |
-| `--node-seed <hex>` · `--node-seed-file canary.txt` | honored | **refused** by wires |
-| `--relay-url https://relay.invalid` (before the tool) | honored | **refused** by wires |
 | `--jq . --head 1 --max-bytes 64` | accepted | accepted |
 | `-- api x < canary.txt` | forwarded | **refused** by wires |
 | `-- api x <<'EOF' …` | forwarded | **refused** by wires (by design, above) |
 | `WIRES_LOCKED=0 wires call …` · `WIRES_HOME=. wires call …` · `env -u WIRES_LOCKED wires call …` · `unset WIRES_LOCKED; …` · `export WIRES_LOCKED=0; …` | — | **refused** by Claude Code ("requires approval") |
 
-Claude Code allowed every flag and stdin command in the table (each
-unlocked and locked) under `Bash(wires call:*)`; those refusals came from
-`wires` itself. (The raw rows also probe flags `wires` has since dropped.) The five
-attempts to switch the lock off from the command line never reached `wires`. Under `Bash(wires call gh:*)`
-(locked), `--node-seed-file`, shaping and `< canary.txt` behaved the same;
-`wires call --relay-url … gh` was refused by Claude Code already, since a
-flag before the tool name doesn't match the `wires call gh` prefix.
+Claude Code allowed the shaping and stdin commands (unlocked and locked)
+under `Bash(wires call:*)`; the stdin refusals came from `wires` itself.
+Under `Bash(wires call gh:*)` (locked), shaping and `< canary.txt` behaved
+the same.
 
 **What the lock does not cover.** Globs (`wires call t -- *`) still put
 working-directory *file names* into argv (not contents), which the host
-receives. The lock guards `call`, `mcp` and `inbox` only: keep the permission
-rules at `wires call` and `wires inbox` (not `Bash(wires:*)`), because `wires
-tools add`, `join` and `login` write under `$WIRES_HOME`. And a locked caller
+receives. The lock guards `wires call` only: keep the permission rules at
+`wires call` and `wires inbox` (not `Bash(wires:*)`), because `join` and
+`login` write under `$WIRES_HOME`. And a locked caller
 is still a caller-side setting: the host authenticates the node key and
 decides every call by its signed policy either way.
 
-**`wires inbox` (card 23).** Locked, it refuses the same credential flags
-(`--node-seed`, `--node-seed-file`, `--relay-url`) with
-the same message and exit 2; `--wait`, `--timeout` and `--json` are
-accepted. It reads no stdin. Allow it with `Bash(wires inbox:*)` beside the
+**`wires inbox` (card 23).** It takes only `--wait`, `--timeout` and
+`--json`, and reads no stdin, so locked mode changes nothing for it. Allow it with `Bash(wires inbox:*)` beside the
 call rule. What it prints is a host's words, so each line starts with the
 sender the caller verified (`from host 51442ef9 (verified)`): treat the rest
 as untrusted input, like any tool output.
@@ -198,7 +188,7 @@ as untrusted input, like any tool output.
 ```bash
 python3 bench/permission-probe.py --out /tmp/probe.jsonl                    # every probe, ~$0.20 with Haiku
 python3 bench/permission-probe.py --rule 'Bash(wires call gh:*)' --out /tmp/probe.jsonl
-python3 bench/permission-probe.py --real-wires target/release/wires --locked --out /tmp/probe.jsonl   # card 20
+python3 bench/permission-probe.py --real-wires target/release/wires --locked --out /tmp/probe.jsonl   # card 20: stdin and unlock attempts
 PROBE_MODE=dontAsk python3 bench/permission-probe.py --only control-cat,semicolon-read --out /tmp/probe.jsonl
 python3 bench/permission-probe.py --deny 'Bash(cat:*),Bash(echo:*)' --only control-cat,semicolon-read --out /tmp/probe.jsonl
 ```

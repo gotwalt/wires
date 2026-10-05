@@ -17,7 +17,7 @@ Tasks:
 
 Per run: turns, tokens, cost, the wires commands run, and `guessed`: the
 tool results that show the model guessed a flag or subcommand (a clap
-usage error, or a locked-mode refusal of an override flag).
+usage error).
 """
 
 from __future__ import annotations
@@ -67,7 +67,6 @@ GUESS_MARKERS = [
     "error: unrecognized subcommand",
     "error: invalid value",
     "error: a value is required",
-    "is not allowed in locked mode",
 ]
 ADDRESS = re.compile(r"\b\d{1,3}(\.\d{1,3}){3}\b|\bssh\b|\bip address\b|--relay-url|host address", re.I)
 

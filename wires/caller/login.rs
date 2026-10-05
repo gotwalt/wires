@@ -86,13 +86,6 @@ pub(crate) struct LoginArgs {
     /// The network string your admin prints with `wires network` (the first
     /// time only: it joins this node to that network).
     pub network: Option<String>,
-    /// Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`,
-    /// then `--node-seed-file`, then the keystore (`node.seed`).
-    #[arg(long, hide = true)]
-    pub node_seed: Option<String>,
-    /// Read the node key seed (hex) from this file.
-    #[arg(long, hide = true)]
-    pub node_seed_file: Option<std::path::PathBuf>,
     /// OIDC issuer. Falls back to `$WIRES_OIDC_ISSUER`, then the network
     /// string's, then Google.
     #[arg(long, hide = true)]
@@ -735,8 +728,9 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
         );
     }
     let home = keystore::home()?;
-    let node =
-        keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?.node_id();
+    // The keystore's own key: the token is stored beside it, bound to it.
+    let identity = keystore::node_identity_in(&ks)?;
+    let node = identity.node_id();
     let client = OidcClient::resolve(&a, read_settings(&ks))?;
     let fetcher = KeyFetcher::new(Some(home.join(crate::caller::jwks::JWKS_DIR)))?;
     let token_path = ks.path(ID_TOKEN_FILE);
@@ -797,7 +791,6 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
     }
     // Card 37: the view under the new identity (the old one was someone
     // else's, or no one's).
-    let identity = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
     match ks.network_root()? {
         None => eprintln!("wires login: {}", crate::help::NOT_JOINED),
         Some(root) => {

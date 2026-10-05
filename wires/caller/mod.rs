@@ -12,13 +12,10 @@
 //! - [`shape`] — `--jq` / `--head` / `--max-bytes`: output shaping, in-process.
 //! - [`inbox`] — `wires inbox`: what hosts pushed to this caller (card 23),
 //!   fetched from the hosts of its services, or received while `--wait`s.
-//! - [`lock`] — locked mode: `WIRES_LOCKED=1` refuses the override flags so a
-//!   sandboxed agent can't steer `call`/`mcp`/`inbox` off the operator's
-//!   config.
+//! - [`lock`] — locked mode: `WIRES_LOCKED=1` refuses a `wires call` whose
+//!   stdin holds data, so a sandboxed agent can't carry local files to a host.
 //! - [`mcp`] — the same calls as MCP tools over stdio (`wires gateway`
 //!   serves them over HTTP).
-//! - [`tools`] — `tools.json`: locked mode, and local aliases (name → one
-//!   host, with address hints).
 //! - [`login`] — OIDC sign-in, nonce-bound to this node's key.
 //! - [`jwks`] — issuer discovery and key fetching for ID-token verification.
 //! - `mock_idp` — a hermetic OIDC issuer (tests and the dev build only).
@@ -47,7 +44,6 @@ pub mod mock_idp;
 pub mod pick;
 pub mod services;
 pub mod shape;
-pub mod tools;
 pub mod view;
 
 /// `s` on one line: newlines and every other control character escaped, so

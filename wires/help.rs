@@ -98,7 +98,7 @@ Examples:
 
 Exit: the service's own code. 77: refused by policy, nothing on stdout (don't
 retry; ask your admin). 1: a local or transport failure (a service's own 77
-is reported as 1). 2: a usage error (a bad --jq, a flag locked mode refuses).";
+is reported as 1). 2: a usage error (a bad --jq, or stdin in locked mode).";
 
 /// `wires services`: examples and the output shape.
 pub(crate) const SERVICES_AFTER: &str = "\

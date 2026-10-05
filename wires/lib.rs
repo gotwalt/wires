@@ -31,9 +31,9 @@
 //! TypeScript bindings (`bindings/`) are built on the same API, sharing a
 //! call's stdio through [`SharedIo`].
 //!
-//! The node key resolves through flag → env → `--node-seed-file` → on-disk
-//! keystore (`admin/keystore.rs`), so once `wires login <network>` has run,
-//! `wires call <service>` and `wires mcp` need no other flags — which
+//! A caller's node key is the keystore's (`$WIRES_HOME`, `admin/keystore.rs`),
+//! so once `wires login <network>` has run, `wires call <service>` and
+//! `wires mcp` need no flags — which
 //! is what lets `wires mcp` drop straight into an MCP client's config as
 //! `"command": "wires"`.
 //!
@@ -159,13 +159,6 @@ enum Command {
         override_usage = "wires call [OPTIONS] <SERVICE> [-- <ARGS>...]"
     )]
     Call(caller::call::CallArgs),
-    /// Edit the local aliases in `tools.json`: add, list, rm
-    #[command(
-        hide = true,
-        subcommand_required = true,
-        after_help = "Example:\n  wires tools list"
-    )]
-    Tools(caller::tools::ToolsArgs),
     /// Serve the services you may call as MCP tools over stdio
     #[command(after_help = help::MCP_AFTER)]
     Mcp(caller::mcp::McpArgs),
@@ -341,7 +334,6 @@ pub fn run() {
             set_verbose(a.verbose);
             print_or_exit(runtime().block_on(caller::services::run(&a)))
         }
-        Command::Tools(a) => print_or_exit(caller::tools::run_tools_cmd(a)),
         Command::Mcp(a) => {
             init_quiet_logging();
             let served = runtime().block_on(caller::mcp::mcp_cmd(a));

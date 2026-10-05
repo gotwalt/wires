@@ -9,7 +9,7 @@ Options:
       --check
           Check HOST_JSON, print the services it implements and its IdPs; exit
       --node-seed <NODE_SEED>
-          Hex 32-byte seed of this host's node key. Falls back to `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`)
+          Hex 32-byte seed of this host's node key. Falls back to `--node-seed-file`, then the keystore (`node.seed`)
       --node-seed-file <NODE_SEED_FILE>
           Read the node key seed (hex) from this file instead of the keystore
       --relay-url <RELAY_URL>

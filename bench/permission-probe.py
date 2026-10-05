@@ -29,8 +29,10 @@ outside the scratch directory.
 
 Card 20 (locked caller mode): `--real-wires target/release/wires [--locked]`
 swaps the fake for the real binary (empty scratch WIRES_HOME, so nothing is
-dialed) and runs WIRES_PROBES instead: `wires call`'s own override flags and
-stdin, each counted as "ran" unless wires refused it in locked mode.
+dialed) and runs WIRES_PROBES instead: `wires call`'s shaping flags, its
+stdin, and attempts to switch the lock off, each counted as "ran" unless wires
+refused it in locked mode. (Card 44 removed the override flags these probed
+first: `--tools-file`, `--node-seed[-file]`, `--relay-url`.)
 """
 
 from __future__ import annotations
@@ -112,26 +114,22 @@ PROBES: dict[str, tuple[str, tuple]] = {
     "escaped-semicolon": (f"{W}\\; touch m/escaped-semicolon", ("marker", "escaped-semicolon")),
 }
 
-# Card 20: `wires call`'s own override flags, against the REAL binary
-# (`--real-wires`, optionally `--locked`). "Ran" means wires honored the
-# flag or the stdin, i.e. its output does not carry the locked-mode refusal.
-# WIRES_HOME is an empty scratch dir, so an honored call then fails on "has
-# not joined a network" and never dials anything.
-SEED = "00" * 32
+# Card 20: locked mode, against the REAL binary (`--real-wires`, optionally
+# `--locked`). "Ran" means wires honored the call or its stdin, i.e. its
+# output does not carry the locked-mode refusal. WIRES_HOME is an empty
+# scratch dir, so an honored call then fails on "has not joined a network"
+# and never dials anything.
+R = "wires call gh -- api x < canary.txt"
 WIRES_PROBES: dict[str, tuple[str, tuple]] = {
-    "flag-tools-file": ("wires call gh --tools-file canary.txt -- --version", ("honored",)),
-    "flag-node-seed": (f"wires call gh --node-seed {SEED} -- --version", ("honored",)),
-    "flag-node-seed-file": ("wires call gh --node-seed-file canary.txt -- --version", ("honored",)),
-    "flag-relay-url": ("wires call --relay-url https://relay.invalid gh -- --version", ("honored",)),
     "flag-shaping": ("wires call gh --jq . --head 1 --max-bytes 64 -- --version", ("honored",)),
-    "stdin-redirect": ("wires call gh -- api x < canary.txt", ("honored",)),
+    "stdin-redirect": (R, ("honored",)),
     "stdin-heredoc": ("wires call gh -- api x <<'EOF'\nhello\nEOF", ("honored",)),
     # Can the agent switch the lock off from the command line?
-    "env-unlock": ("WIRES_LOCKED=0 wires call gh --tools-file canary.txt -- --version", ("honored",)),
-    "env-rehome": ("WIRES_HOME=. wires call gh --tools-file canary.txt -- --version", ("honored",)),
-    "env-u-unlock": ("env -u WIRES_LOCKED wires call gh --tools-file canary.txt -- --version", ("honored",)),
-    "unset-unlock": ("unset WIRES_LOCKED; wires call gh --tools-file canary.txt -- --version", ("honored",)),
-    "export-unlock": ("export WIRES_LOCKED=0; wires call gh --tools-file canary.txt -- --version", ("honored",)),
+    "env-unlock": (f"WIRES_LOCKED=0 {R}", ("honored",)),
+    "env-rehome": (f"WIRES_HOME=. {R}", ("honored",)),
+    "env-u-unlock": (f"env -u WIRES_LOCKED {R}", ("honored",)),
+    "unset-unlock": (f"unset WIRES_LOCKED; {R}", ("honored",)),
+    "export-unlock": (f"export WIRES_LOCKED=0; {R}", ("honored",)),
 }
 
 LOCK_REFUSALS = ("in locked mode",)

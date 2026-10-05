@@ -453,7 +453,7 @@ pub(crate) async fn callback<B: Backend>(
     };
     // Card 37: the user's view, cut by a directory for their own token.
     match gw.tools_for(&session).await {
-        Ok((_, tools)) if tools.tools.is_empty() => {
+        Ok((_, tools)) if tools.is_empty() => {
             tracing::info!("gateway: {who} may call nothing here; refused");
             return back(
                 "access_denied",
@@ -461,7 +461,7 @@ pub(crate) async fn callback<B: Backend>(
             );
         }
         Ok((_, tools)) => {
-            tracing::info!("gateway: {who} signed in ({} services)", tools.tools.len())
+            tracing::info!("gateway: {who} signed in ({} services)", tools.len())
         }
         Err(e)
             if e.downcast_ref::<crate::caller::view::NotAdmitted>()
