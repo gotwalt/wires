@@ -1,6 +1,6 @@
 # 39 — The premise and the story
 
-**Stage:** 3 · **Depends on:** [41](../done/41-idp-membership.md) merged (the commands the docs show must exist) · **Status:** doing (story half merged 2026-10-05; reference half in progress); the premise itself is on the [board](../README.md) (2026-10-05) · **Files:** `README.md`, `docs/executive-summary.md`, `docs/blog/introducing-wires.md`, `docs/storytelling.md`, `docs/usage.md`, `docs/fabric.md`, `docs/demo.md`, `docs/deployment.md`, `docs/testing.md`, `docs/agent-sandbox.md`, `docs/media/`, `CLAUDE.md`, `wires/help.rs` (the premise paragraph only)
+**Stage:** 3 · **Depends on:** [41](41-idp-membership.md) merged (the commands the docs show must exist) · **Status:** done (merged into `simplify` 2026-10-05; checked by [card 43](43-accuracy-sweep.md)) · **Files:** `README.md`, `docs/executive-summary.md`, `docs/blog/introducing-wires.md`, `docs/storytelling.md`, `docs/usage.md`, `docs/fabric.md`, `docs/demo.md`, `docs/deployment.md`, `docs/testing.md`, `docs/agent-sandbox.md`, `docs/media/`, `CLAUDE.md`, `wires/help.rs` (the premise paragraph only)
 
 ## Why
 
@@ -22,8 +22,8 @@ chose (2026-10-04/05):
   irrelevant." `wires mcp` and `wires gateway` carry existing MCP workflows
   over; the gateway is worth having for Claude on the web.
 - **Cut for now:** the signed call log, OTLP and `wires watch`
-  ([card 40](../done/40-cut-records.md)). **Gone:** badges and invites
-  ([card 41](../done/41-idp-membership.md)).
+  ([card 40](40-cut-records.md)). **Gone:** badges and invites
+  ([card 41](41-idp-membership.md)).
 
 ## What to write
 

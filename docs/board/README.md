@@ -8,11 +8,12 @@ reached by key, with no port or VPN; and a service can message its caller
 back. MCP clients reach the same services through a bridge.
 
 This replaces the premise of 2026-09-23. What changed, and why, is on cards
-[39](doing/39-premise-and-story.md)–[43](backlog/43-accuracy-sweep.md) (40, 41, 42 and 47 are in [done/](done/)):
-the signed call log and `wires watch` are cut for now, a node is admitted by
-its person's IdP sign-in and nothing else (no badges, no invites), and MCP
-is a bridge from existing workflows, not a goal of its own. The code matches this page as of card 41; [card 47](done/47-admission-hardening.md)
-tightened admission after its review.
+39–43 and 47 in [done/](done/): the signed call log and `wires watch` are cut
+for now, a caller is admitted by its person's IdP sign-in and nothing else
+(no badges, no invites; a role must match), and MCP is a bridge from existing
+workflows, not a goal of its own. The code matches this page;
+[card 43](done/43-accuracy-sweep.md) lists what was checked and what is left
+for the human.
 
 **Non-negotiables:** E2EE with a blind relay (no host or relay holds a key
 it doesn't need; a service child is handed none of the host's keystore,
@@ -81,9 +82,7 @@ Open cards only; finished cards are in [done/](done/).
 
 | Card | Stage | Depends on | Status | Summary |
 |---|---|---|---|---|
-| [39](doing/39-premise-and-story.md) | 3 | — | doing | **The story:** README, summary, post, usage and the rest rewritten to the premise |
-| [43](backlog/43-accuracy-sweep.md) | 4 | 39 | backlog | **Accuracy sweep:** every doc, comment, help text, script and example checked against the code |
-| [08](doing/08-demo-two-machine.md) | — | 43 | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent; re-record |
+| [08](doing/08-demo-two-machine.md) | — | — | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent; re-record |
 | [44](backlog/44-cut-aliases-and-overrides.md) | — | 41 | backlog, not scheduled | Cut `tools.json` aliases and the caller's credential-override flags; shrink locked mode |
 | [45](backlog/45-trim-policy-sync.md) | — | 41 | backlog, not scheduled | One way to keep policy copies in step: no deltas, freshness beats, replicas or view subscriptions |
 | [46](backlog/46-spread-calls-across-hosts.md) | — | — | backlog, not scheduled | Spread calls across a service's hosts, so more hosts means more capacity |
@@ -92,8 +91,7 @@ Open cards only; finished cards are in [done/](done/).
 | [32](backlog/32-service-sandbox-OPEN.md) | — | — | open question | **Don't build:** run each service call in a rootless microVM |
 | [18](backlog/18-front-door-OPEN.md) | — | 41 | open question | **Don't build:** `wires login <domain>`, the network string published under a domain |
 
-**Order:** 43 → 08 (re-record). 40, 41, 42 and 47 are done; 39 is merged and waits on the sweep. 44–46 are drafted, not
-scheduled.
+**Order:** 08 (re-record the demo). 44–46 are drafted, not scheduled; 39–43 and 47 are done.
 
 ## Rules for workers
 

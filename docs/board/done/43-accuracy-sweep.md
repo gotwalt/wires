@@ -1,6 +1,6 @@
 # 43 — Accuracy sweep: nothing says what is no longer true
 
-**Stage:** 4 · **Depends on:** [39](39-premise-and-story.md), [40](../done/40-cut-records.md), [41](../done/41-idp-membership.md), [42](../done/42-caller-identity-for-services.md) merged · **Status:** backlog · **Files:** all of them, read-mostly
+**Stage:** 4 · **Depends on:** [39](39-premise-and-story.md), [40](40-cut-records.md), [41](41-idp-membership.md), [42](42-caller-identity-for-services.md) merged · **Status:** done (merged into `simplify` 2026-10-05) · **Files:** all of them, read-mostly
 
 ## Why (the human, 2026-10-05)
 
@@ -86,3 +86,51 @@ in *Notes* with the file and line.
 - [ ] *Notes* holds the findings: fixed, and left for the human.
 
 ## Notes
+
+Four reviewers who wrote none of the change, one per kind of file (2026-10-05), then the
+integrator's final run.
+
+**Fixed.**
+- `docs/protocol.md`: about 60 claims corrected against the code, six unstated limits added to §9.
+- Narrative docs: every quoted output re-captured from the current binary; card 47's fourteen
+  user-visible changes applied; all `sweep:` markers resolved; links checked.
+- Rust: comments and rustdoc in about 60 files; help text and snapshots (orphan snapshots now fail
+  the test); dead code removed (`allowed_services`, `Grant`, `Policy::hosts`, redb's `current`
+  table and stored `Fresh`, an unused dependency); five tests that passed for the wrong reason.
+- Scripts: demo narration and assertions, the three bench `up.sh` scripts run end to end against
+  the stand-in IdP, a `demo-push` make target, `deploy/gateway/.env.example`'s `issuer set` command.
+- Code defects found by the sweep, each with a test: keystore files and directories created wider
+  than 0600 / 0700 (one writer now, `keystore::write_private`); a resync after `wires restore` on a
+  host that is also a directory; `wires call` with no token dialing a directory; a directory
+  serving an expired policy; a refused call not marking the view as behind; the gateway telling a
+  user no role matches to "try again"; `wires inbox` exiting 0 when not admitted; three log lines
+  for one refusal; an unreachable IdP costing a fetch per token; no silence timeout on a replica
+  subscription.
+
+**Final run** (integrator, quiet machine, `simplify` at the merge): clippy `-D warnings`, `cargo
+fmt --check`, shellcheck and shfmt clean; `cargo test --workspace` green (145 library, 409 wires,
+doctests); all four demo runs pass (`demo-remote-cli`, `demo-push`, native service in Python and
+TypeScript).
+
+**Left for the human.**
+- The removed-host window is the policy head's lifetime (90 days by default). A shorter default
+  narrows it and makes the admin re-sign more often ([card 45](../backlog/45-trim-policy-sync.md)).
+- `Matcher` has optional signed fields, against protocol.md §1 (not exploitable: the items hash
+  re-serializes). Smallest fix: plain strings with empty meaning "any", and a new item format.
+- Renames not done because they cross the wire or forty files: `StateVersion` / `state_version`
+  → policy version; `Error::FabricMismatch`; `library::registry`; `caller/jwks.rs` is shared by
+  host, directory and gateway. `RemoteTool` goes with [card 44](../backlog/44-cut-aliases-and-overrides.md).
+- Unexplained: in two hand runs, the first admin edit after restarting a host that is also a
+  directory reached 1 of 2 directories (exit 0, "not reached").
+- Trace-capture tests can miss events when tests run in parallel (seen once in
+  `push::tests::a_banned_persons_fetch_drops_the_queue`; passes on rerun). The e2e tests don't
+  assert the per-call log line for the same reason.
+- Benchmarks were not re-run on this code. Their setup signs in once and a Google sign-in lasts an
+  hour, so a full run can outlast it. `bench/bench.py`'s wires-only prompt says "tool name".
+- A service run as a separate Unix user can't reach its push socket (0700, owned by `serve`'s
+  user); `deployment.md`'s sudoers sketch is untested.
+- Unreachable branches kept: the `None`-principal paths in `call_trace`, `Identities::record` and
+  `authorize`.
+- `CLAUDE.md` still says "The goal is a sharp demo for the MCP team"; MCP is now a bridge.
+- `wires mcp` still speaks five MCP protocol versions for older clients.
+- The demo recording is gone from the README and must be redone ([card 08](../doing/08-demo-two-machine.md)).
