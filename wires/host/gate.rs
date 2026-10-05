@@ -539,21 +539,23 @@ impl ServicesHost {
     ) -> std::result::Result<Admitted, String> {
         self.check_vouched(state, now).map_err(|r| r.to_string())?;
         admit(state, &self.config, self.me, caller, verified, service, now)
+            // The detail is for `debug`: the one `info` line a refusal makes
+            // is its `call refused` line (call_trace).
             .inspect_err(|r| match r {
-                GateRefusal::AlsoRequire { roles, .. } => tracing::info!(
+                GateRefusal::AlsoRequire { roles, .. } => tracing::debug!(
                     caller = %caller.hex(),
                     service = %service,
                     also_require = ?roles.iter().map(RoleName::as_str).collect::<Vec<_>>(),
                     "refused by this host's also_require"
                 ),
                 // The caller hears one fixed sentence; which it was is here.
-                GateRefusal::NotCallable { refusal, .. } => tracing::info!(
+                GateRefusal::NotCallable { refusal, .. } => tracing::debug!(
                     caller = %caller.hex(),
                     service = %service,
                     why = %refusal,
                     "refused by the signed policy"
                 ),
-                GateRefusal::NotAdmitted { why } => tracing::info!(
+                GateRefusal::NotAdmitted { why } => tracing::debug!(
                     caller = %caller.hex(),
                     service = %service,
                     why = %why,

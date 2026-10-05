@@ -514,21 +514,27 @@ impl iroh::protocol::ProtocolHandler for ServicesProtocol {
         // Let the dialer read a `Denied` (or the final frames) before the
         // connection is torn down; bounded so a vanished dialer can't pin us.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
-        result.map_err(|e| {
-            if e.downcast_ref::<Refused>().is_some() {
+        match result {
+            Ok(()) => Ok(()),
+            // An ordinary refusal: already traced (its `call refused`
+            // line, or the throttled stranger line), and no error to the
+            // router, which would log it again as a failed connection.
+            Err(e) if e.downcast_ref::<Refused>().is_some() => {
                 tracing::debug!(caller = %caller.hex(), "{e:#}");
-            } else {
-                tracing::warn!(caller = %caller.hex(), "session failed: {e:#}");
+                Ok(())
             }
-            iroh::protocol::AcceptError::from_boxed(e.into())
-        })
+            Err(e) => {
+                tracing::warn!(caller = %caller.hex(), "session failed: {e:#}");
+                Err(iroh::protocol::AcceptError::from_boxed(e.into()))
+            }
+        }
     }
 }
 
 /// Refuse an **admitted** caller: write its log line
 /// ([`call_trace::refused`](crate::host::call_trace::refused)) and send the
 /// reason, cut as the frame carries it.
-async fn refuse_member<W: AsyncWrite + Unpin>(
+async fn refuse_admitted<W: AsyncWrite + Unpin>(
     send: &mut W,
     caller: NodeId,
     principal: Option<&library::Principal>,
@@ -674,14 +680,14 @@ where
         Ok(admitted) => admitted,
         Err(reason) => {
             let who = principal.as_ref();
-            return Err(refuse_member(&mut send, caller, who, &service, reason).await);
+            return Err(refuse_admitted(&mut send, caller, who, &service, reason).await);
         }
     };
     // Only an admitted caller learns whether this host implements it.
     let Some(implementation) = host.implementation(&service) else {
         let reason = format!("service {service} is not implemented on this host");
         let who = principal.as_ref();
-        return Err(refuse_member(&mut send, caller, who, &service, reason).await);
+        return Err(refuse_admitted(&mut send, caller, who, &service, reason).await);
     };
     drop(preauth);
     let version = admitted.state_version;
@@ -1789,6 +1795,17 @@ mod tests {
         .await;
         let refused = lines.matching("call refused");
         assert_eq!(refused.len(), 1, "{}", lines.text());
+        // …and it is the refusal's only `info` line (the gate's detail is
+        // at `debug`).
+        let info: Vec<String> = lines
+            .matching(" INFO ")
+            .into_iter()
+            .filter(|l| l.contains("wires::"))
+            .filter(|l| !l.contains("unadmitted peer(s) since the last report"))
+            // Once per host, when it first verifies a token: not the call's.
+            .filter(|l| !l.contains("trusted issuers changed"))
+            .collect();
+        assert_eq!(info, refused, "{}", lines.text());
         let line = &refused[0];
         assert!(line.contains(" INFO "), "{line}");
         assert!(line.contains("service=nope"), "{line}");
