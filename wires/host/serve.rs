@@ -235,12 +235,15 @@ pub(crate) async fn serve_until(
             ks: Arc::clone(&ks),
             root: host.trust_root,
             freshness: Arc::clone(&host.freshness),
-            runs_directory: directory.is_some(),
+            directory: directory.clone(),
             stats: Default::default(),
         }
         .run(),
     );
     if let Some(dir) = &directory {
+        // Its proof shows a caller the host's `Fresh`es too (another
+        // directory's among them), card 45.
+        let _ = dir.host_freshness.set(Arc::clone(&host.freshness));
         following.spawn(follow::vouch_from_local(
             Arc::clone(dir),
             Arc::clone(&ks),
@@ -250,7 +253,7 @@ pub(crate) async fn serve_until(
     }
     let running = directory
         .as_ref()
-        .map(|dir| crate::directory::serve::Running::start(Arc::clone(dir), endpoint.clone()));
+        .map(|dir| crate::directory::serve::Running::start(Arc::clone(dir)));
     // A host that is its own directory decides nothing until a policy that
     // assigns its services arrives (the first publish, on a new network).
     let shutdown = async {
@@ -282,7 +285,7 @@ pub(crate) async fn serve_until(
         None => shutdown.await,
     };
     // Stop everything this host started, so an app that embeds it can go
-    // on without it: the subscription, the directory's loops, the router
+    // on without it: the subscription, the directory's beat, the router
     // (its protocols and sessions), and the endpoint (the socket and the
     // relay connection).
     following.shutdown().await;

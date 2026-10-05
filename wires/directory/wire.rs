@@ -1,5 +1,7 @@
 //! Frame I/O for the directory's two ALPNs, the one-request client
-//! ([`ask`]) every other role uses, and the admin's [`publish`].
+//! ([`ask`]) hosts use, the caller's client that reads a directory's proof
+//! before it presents a token ([`open`], card 45), and the admin's
+//! [`publish`].
 //!
 //! The frames are [`library::directory`]'s. Nothing is sized from a peer's
 //! length prefix: a buffer grows only as bytes arrive, and a prefix over the
@@ -13,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::Endpoint;
 use library::{
-    DIRECTORY_ALPN, DirectoryAnswer, DirectoryRequest, IdToken, MAX_DIRECTORY_FRAME,
+    DIRECTORY_ALPN, DirectoryAnswer, DirectoryRequest, HostProof, IdToken, MAX_DIRECTORY_FRAME,
     MAX_SMALL_DIRECTORY_FRAME, NodeId, SignedPolicy, SubFrame, SubRequest,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -25,6 +27,10 @@ pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long one frame (a request, or the answer to one) may take.
 pub(crate) const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The largest proof a caller reads from a directory before it has said
+/// anything but `open`, as from a host (card 49).
+pub(crate) const MAX_PROOF_FRAME: usize = 64 * 1024;
 
 /// Write already-encoded frame bytes.
 pub(crate) async fn write<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> Result<()> {
@@ -111,7 +117,7 @@ pub(crate) async fn read_items<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<li
     }
 }
 
-/// Read the frame that opens a `wires/directory/2` stream, before its
+/// Read the frame that opens a `wires/directory/3` stream, before its
 /// sender is admitted, within `deadline`: at most
 /// [`MAX_SMALL_DIRECTORY_FRAME`]. The caller checks it is a `hello`.
 pub(crate) async fn read_hello<R: AsyncRead + Unpin>(
@@ -156,15 +162,108 @@ pub(crate) async fn read_sub_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Op
     read_capped(r, MAX_DIRECTORY_FRAME, SubFrame::decode).await
 }
 
-/// Dial directory `dir` by key, open with `hello` (our ID token, when we
-/// act for a person), send `request`, and return its one answer.
+/// Dial directory `dir` by key, open with a `hello` that presents no token
+/// (a host's or directory's: the policy names its key), send `request`,
+/// and return its one answer. A caller presents its token only after a
+/// directory's proof ([`open`]).
 pub(crate) async fn ask(
+    endpoint: &Endpoint,
+    dir: NodeId,
+    request: &DirectoryRequest,
+) -> Result<DirectoryAnswer> {
+    exchange(endpoint, dir, None, &[request.encode()?]).await
+}
+
+/// [`ask`] presenting `id_token` at once, with no proof first: for tests
+/// of the directory's own admission, which never trusts a dialer to have
+/// checked.
+#[cfg(test)]
+pub(crate) async fn ask_presenting(
     endpoint: &Endpoint,
     dir: NodeId,
     id_token: Option<IdToken>,
     request: &DirectoryRequest,
 ) -> Result<DirectoryAnswer> {
     exchange(endpoint, dir, id_token, &[request.encode()?]).await
+}
+
+/// A stream to a directory that has shown its proof and been told nothing
+/// else: the caller checks [`proof`](Self::proof), then [`ask`](Self::ask)s
+/// (presenting its token) or drops it.
+pub(crate) struct Opened {
+    /// What it showed.
+    pub(crate) proof: HostProof,
+    conn: iroh::endpoint::Connection,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+}
+
+impl Opened {
+    /// Present `id_token` and send `request`; its one answer, within
+    /// [`FRAME_TIMEOUT`].
+    pub(crate) async fn ask(
+        mut self,
+        id_token: Option<IdToken>,
+        request: &DirectoryRequest,
+    ) -> Result<DirectoryAnswer> {
+        let answer = tokio::time::timeout(FRAME_TIMEOUT, async {
+            write(
+                &mut self.send,
+                &DirectoryRequest::Hello { id_token }.encode()?,
+            )
+            .await?;
+            write(&mut self.send, &request.encode()?).await?;
+            self.send.finish().ok();
+            read_answer(&mut self.recv).await
+        })
+        .await
+        .unwrap_or_else(|_| Err(anyhow!("no directory answer within {FRAME_TIMEOUT:?}")));
+        self.conn.close(0u32.into(), b"done");
+        answer
+    }
+}
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        self.conn.close(0u32.into(), b"done");
+    }
+}
+
+/// Dial directory `dir` and open with `open {}`: read its proof (at most
+/// [`MAX_PROOF_FRAME`], within [`FRAME_TIMEOUT`]) and say nothing more yet.
+/// A `denied` (it holds no policy it can vouch for) is an error.
+pub(crate) async fn open(endpoint: &Endpoint, dir: NodeId) -> Result<Opened> {
+    let addr = transport::endpoint_addr(&dir, &[], None)?;
+    let conn = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, DIRECTORY_ALPN))
+        .await
+        .map_err(|_| anyhow!("no answer within {DIAL_TIMEOUT:?}"))?
+        .map_err(|e| anyhow!("dialing directory {}…: {e}", dir.short()))?;
+    let opened = tokio::time::timeout(FRAME_TIMEOUT, async {
+        let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
+        write(&mut send, &DirectoryRequest::Open {}.encode()?).await?;
+        let answer = read_capped(&mut recv, MAX_PROOF_FRAME, DirectoryAnswer::decode)
+            .await?
+            .ok_or_else(|| anyhow!("the directory closed without its proof"))?;
+        match answer {
+            DirectoryAnswer::Proof { proof } => Ok((send, recv, proof)),
+            DirectoryAnswer::Denied { reason } => bail!("refused: {reason}"),
+            other => bail!("an answer out of turn: {other:?}"),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err(anyhow!("no proof within {FRAME_TIMEOUT:?}")));
+    match opened {
+        Ok((send, recv, proof)) => Ok(Opened {
+            proof,
+            conn,
+            send,
+            recv,
+        }),
+        Err(e) => {
+            conn.close(0u32.into(), b"done");
+            Err(e)
+        }
+    }
 }
 
 /// Publish `policy` to directory `dir`: `hello` (no token: the root's

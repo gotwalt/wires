@@ -185,8 +185,8 @@ impl Credentials {
 }
 
 /// The live [`Caller`]: dials over wires with this node's [`Credentials`],
-/// from the view in its keystore (which `wires mcp`'s subscription keeps
-/// current, so a call needs no refresh after it).
+/// from the view in its keystore (which `wires mcp`'s poll keeps current,
+/// so a call needs no refresh after it).
 pub struct WiresCaller {
     creds: Credentials,
 }
@@ -327,7 +327,7 @@ pub(crate) struct CallOpts {
     /// Name the host that answered on stderr.
     pub(crate) verbose: bool,
     /// After a host reported a newer head, refresh the view from a
-    /// directory (a one-shot `wires call`; a subscriber doesn't need to).
+    /// directory (a one-shot `wires call`; `wires mcp` polls instead).
     pub(crate) refresh_after: bool,
 }
 
@@ -394,11 +394,12 @@ where
         None => resolve_entry(creds, ks, dial.endpoint, service).await?,
     };
     let mut vouch = Vouching::new(creds.root, held, Scope::Service(service.clone()))
-        .refreshing(Refresher {
-            ks: ks.clone(),
-            endpoint: dial.endpoint.clone(),
-            id_token: creds.id_token(ks),
-        })
+        .refreshing(Refresher::keystore(
+            ks.clone(),
+            dial.endpoint.clone(),
+            creds.root(),
+            creds.id_token(ks),
+        ))
         .keeping_in(Sink::Keystore(ks.clone()));
     let called = call_entry(
         creds,
@@ -1675,9 +1676,10 @@ mod tests {
         assert!(Unanswered::load(&path).failed_recently(x_id, now).is_some());
     }
 
-    /// A directory on loopback that answers every `view` request with
-    /// `signed`'s whole view for [`me`] and the test directory's word for
-    /// its head; the count of requests it answered.
+    /// A directory on loopback that shows its proof (`signed`'s head and the
+    /// test directory's word for it, card 45), then answers every `view`
+    /// request with `signed`'s whole view for [`me`] and that word; the
+    /// count of requests it answered.
     async fn fake_view_directory(
         me_node: &NodeIdentity,
         signed: &SignedPolicy,
@@ -1695,12 +1697,20 @@ mod tests {
             view: signed.view_for(crate::testutil::any_node(), Some(&me()), None),
             fresh: crate::testutil::test_fresh(&signed.head),
         };
+        let proof = library::DirectoryAnswer::Proof {
+            proof: library::HostProof {
+                head: signed.head.clone(),
+                fresh: vec![crate::testutil::test_fresh(&signed.head)],
+            },
+        };
         tokio::spawn(async move {
             while let Some(incoming) = ep.accept().await {
                 let Ok(conn) = incoming.await else { continue };
                 let Ok((mut send, mut recv)) = conn.accept_bi().await else {
                     continue;
                 };
+                let _open = crate::directory::wire::read_request(&mut recv).await;
+                let _ = crate::directory::wire::write(&mut send, &proof.encode().unwrap()).await;
                 let _hello = crate::directory::wire::read_request(&mut recv).await;
                 let _view = crate::directory::wire::read_request(&mut recv).await;
                 let _ = crate::directory::wire::write(&mut send, &answer.encode().unwrap()).await;

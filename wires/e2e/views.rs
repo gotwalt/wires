@@ -3,7 +3,8 @@
 //! A directory on hermetic loopback holds the policy (handed to it with
 //! [`Directory::accept`]); callers ask it for their view with their own ID
 //! token (the shared mock IdP, [`crate::testutil::test_idp`], which signs in
-//! `caller@example.com`), or follow it by subscription.
+//! `caller@example.com`), once the directory has shown it is current, or
+//! ask again every so often (`wires mcp`'s poll).
 //!
 //! - [`a_callers_keystore_holds_only_its_view`]: no role, no ban, no node
 //!   id but its services' hosts and the directories, and no service it may
@@ -12,11 +13,11 @@
 //!   a caller with no token that verifies; `resolve` finds one service,
 //!   only for a caller that may use it.
 //! - [`a_grant_and_a_revocation_reach_a_running_mcp_within_2s`]: as
-//!   `notifications/tools/list_changed`, through the same subscription,
-//!   mapping and server `wires mcp` runs.
-//! - [`a_view_that_cannot_be_updated_is_fetched_whole_again`]
-//! - [`a_refresh_from_a_kept_head_is_an_update`]: a `view {have}` from a
-//!   head the directory keeps is answered with what changed.
+//!   `notifications/tools/list_changed`, through the same poll, mapping and
+//!   server `wires mcp` runs (polling every 200 ms here).
+//! - [`a_poll_replaces_a_wrong_view_with_the_whole_one`]
+//! - [`a_removed_or_lagging_directory_is_told_no_token`]: card 45, a
+//!   directory is held to the rule a host is (card 49).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,7 +33,7 @@ use super::{PATIENCE, bind_in, localhost_socks, role, service};
 use crate::admin::keystore::Keystore;
 use crate::caller::login::ID_TOKEN_FILE;
 use crate::caller::mcp::{LIST_CHANGED, McpServer, serve_following, services_in};
-use crate::caller::view::{self, Asker, Follow, HeldView};
+use crate::caller::view::{self, Asker, HeldView, Poll};
 use crate::clock::now_unix;
 use crate::directory::node::Directory;
 use crate::directory::serve::Running;
@@ -294,15 +295,17 @@ async fn a_grant_and_a_revocation_reach_a_running_mcp_within_2s() {
     let ks = Arc::new(w.caller_keystore(true));
     let endpoint = w.caller_endpoint().await;
 
-    // What `wires mcp` runs: the subscription, the mapping, the server.
+    // What `wires mcp` runs: the poll (every 200 ms here, not a minute),
+    // the mapping, the server.
     let token_ks = Arc::clone(&ks);
-    let (mut views, follower) = view::follow(Follow {
+    let (mut views, follower) = view::poll(Poll {
         endpoint: endpoint.clone(),
         root: w.root.node_id(),
         id_token: Arc::new(move || crate::caller::hello::stored_token(&token_ks)),
         initial: None,
         fallback: view::joined_directories(&ks),
         persist: Some(Arc::clone(&ks)),
+        every: Duration::from_millis(200),
     });
     let first: Arc<HeldView> = tokio::time::timeout(PATIENCE, views.wait_for(Option::is_some))
         .await
@@ -404,7 +407,7 @@ async fn a_grant_and_a_revocation_reach_a_running_mcp_within_2s() {
     let reply: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
     assert_eq!(names(&reply), ["orders-db", "status"]);
     assert!(revoked.elapsed() < Duration::from_secs(2));
-    // The subscription kept view.json in step, for `wires call`.
+    // The poll kept view.json in step, for `wires call`.
     let stored = view::read(&ks, w.root.node_id()).unwrap().unwrap();
     assert_eq!(stored.version(), StateVersion(5));
     assert!(stored.entry(&service("reports")).is_none());
@@ -417,23 +420,23 @@ async fn a_grant_and_a_revocation_reach_a_running_mcp_within_2s() {
     endpoint.close().await;
 }
 
-/// A subscriber whose view doesn't take an update (here: it holds a view
-/// cut for someone else) subscribes again and gets the whole view.
+/// A poll that starts from a wrong view (here: one cut for nobody) replaces
+/// it with the whole view the directory cuts, and takes each new one.
 #[tokio::test]
-async fn a_view_that_cannot_be_updated_is_fetched_whole_again() {
+async fn a_poll_replaces_a_wrong_view_with_the_whole_one() {
     let w = World::new();
     let v3 = w.policy(3, |_| {});
     let serving = w.directory(&v3).await;
     let ks = Arc::new(w.caller_keystore(true));
     let endpoint = w.caller_endpoint().await;
-    let (mut views, follower) = view::follow(Follow {
+    let (mut views, follower) = view::poll(Poll {
         endpoint: endpoint.clone(),
         root: w.root.node_id(),
         id_token: Arc::new({
             let ks = Arc::clone(&ks);
             move || crate::caller::hello::stored_token(&ks)
         }),
-        // A stale, wrong view: nothing in it.
+        // A wrong view: nothing in it.
         initial: Some(HeldView::fetched(
             v3.view_for(crate::testutil::any_node(), None, None),
             None,
@@ -441,8 +444,8 @@ async fn a_view_that_cannot_be_updated_is_fetched_whole_again() {
         )),
         fallback: vec![],
         persist: None,
+        every: Duration::from_millis(200),
     });
-    // The first frame is the whole view, whatever was held.
     let held = tokio::time::timeout(
         PATIENCE,
         views.wait_for(|v| v.as_ref().is_some_and(|h| !h.view.entries.is_empty())),
@@ -453,7 +456,6 @@ async fn a_view_that_cannot_be_updated_is_fetched_whole_again() {
     .clone()
     .unwrap();
     assert_eq!(held.view.entries.len(), 2);
-    // Then updates apply on top of it.
     let v4 = w.policy(4, |p| {
         p.services.remove(&service("status"));
     });
@@ -473,54 +475,163 @@ async fn a_view_that_cannot_be_updated_is_fetched_whole_again() {
     endpoint.close().await;
 }
 
-/// A caller refreshing from a head the directory still keeps gets only
-/// what changed (`view_update`), applies it, and holds the same view as a
-/// whole fetch would give; a directory that no longer keeps it sends the
-/// whole view.
+/// A fake directory: it answers `open` with a scripted proof, and counts
+/// every frame a dialer sends after that (a `hello` would carry the token).
+#[derive(Clone, Debug)]
+struct Showing {
+    proof: library::HostProof,
+    told: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl iroh::protocol::ProtocolHandler for Showing {
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
+        use crate::directory::wire;
+        use library::{DirectoryAnswer, DirectoryRequest};
+        let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+            return Ok(());
+        };
+        if let Ok(DirectoryRequest::Open {}) = wire::read_hello(&mut recv, PATIENCE).await {
+            let proof = DirectoryAnswer::Proof {
+                proof: self.proof.clone(),
+            };
+            let _ = wire::write(&mut send, &proof.encode().unwrap()).await;
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(PATIENCE, wire::read_hello(&mut recv, PATIENCE)).await
+            {
+                self.told.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Card 45, from card 49's review: a caller tells a directory its ID token
+/// only once that directory has shown it is current, as a host must. X was
+/// a directory; Y and Z are honest ones holding the newest head.
+///
+/// - X removed (version 4 no longer lists it), showing the old head with
+///   its own current word and Y's lapsed one: told nothing; Y gets the
+///   token and the caller's view moves to version 4.
+/// - X showing the current head, with Y's and Z's current words copied, but
+///   not listed in it: told nothing.
+/// - X listed but lagging (it missed version 5), to a caller at version 5:
+///   told nothing.
 #[tokio::test]
-async fn a_refresh_from_a_kept_head_is_an_update() {
-    use library::{DirectoryAnswer, DirectoryRequest};
+async fn a_removed_or_lagging_directory_is_told_no_token() {
     let w = World::new();
-    let v3 = w.policy(3, |_| {});
-    let serving = w.directory(&v3).await;
+    let (x, y, z) = (
+        NodeIdentity::from_seed([41u8; 32]),
+        NodeIdentity::from_seed([42u8; 32]),
+        NodeIdentity::from_seed([43u8; 32]),
+    );
+    let all = vec![x.node_id(), y.node_id(), z.node_id()];
+    let v3 = w.policy(3, |p| p.directories = all.clone());
+    let v4 = w.policy(4, |p| p.directories = vec![y.node_id(), z.node_id()]);
+    let now = now_unix();
+    // Y and Z: real directories, holding version 4.
+    let mut routers = Vec::new();
+    for d in [&y, &z] {
+        let ks = Arc::new(Keystore::at(crate::testutil::temp_dir()));
+        let dir = Directory::open(d.duplicate(), w.root.node_id(), ks, 8, now).unwrap();
+        assert!(dir.accept(&v4, now).unwrap());
+        let ep = bind_in(d, &w.book).await;
+        w.book
+            .add_endpoint_info(endpoint_addr(&d.node_id(), &localhost_socks(&ep), None).unwrap());
+        routers.push(Running::mount(Router::builder(ep), &dir).spawn());
+    }
+    // X: shows what each case scripts.
+    let fake_x = |proof: library::HostProof| {
+        let w = &w;
+        let x = &x;
+        async move {
+            let told = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let ep = bind_in(x, &w.book).await;
+            w.book.add_endpoint_info(
+                endpoint_addr(&x.node_id(), &localhost_socks(&ep), None).unwrap(),
+            );
+            let router = Router::builder(ep)
+                .accept(
+                    library::DIRECTORY_ALPN,
+                    Showing {
+                        proof,
+                        told: Arc::clone(&told),
+                    },
+                )
+                .spawn();
+            (router, told)
+        }
+    };
+    let sign = |d: &NodeIdentity, p: &SignedPolicy, at: i64, until: i64| {
+        library::Fresh::sign(d, &p.head, at, until).unwrap()
+    };
+
+    // The caller holds version 3's view, which lists X first.
     let ks = w.caller_keystore(true);
+    let root = w.root.node_id();
+    let old = v3.view_for(w.caller.node_id(), None, None);
+    view::write(&ks, root, &HeldView::fetched(old, None, 0)).unwrap();
     let endpoint = w.caller_endpoint().await;
     let asker = Asker {
         endpoint: &endpoint,
-        root: w.root.node_id(),
+        root,
         id_token: crate::caller::hello::stored_token(&ks),
     };
-    let held_v3 = view::refresh(&ks, &asker, false).await.unwrap().view;
-    // As the admin signs an edit: unchanged entries keep their signature.
-    let mut p = v3.to_policy().unwrap();
-    p.version = StateVersion(4);
-    p.services.get_mut(&service("status")).unwrap().description = "Build status, now".into();
-    let v4 = p.sign_after(&w.root, &v3).unwrap();
-    assert!(serving.dir.accept(&v4, now_unix()).unwrap());
-    // The frame itself: an update carrying the one changed entry.
-    let answer = crate::directory::wire::ask(
-        &endpoint,
-        w.dir_node.node_id(),
-        asker.id_token.clone(),
-        &DirectoryRequest::View {
-            have: StateVersion(3),
-            query: None,
-            held: Some(library::ViewDigest::of(&held_v3).unwrap()),
-        },
-    )
-    .await
-    .unwrap();
-    let DirectoryAnswer::ViewUpdate { update, .. } = answer else {
-        panic!("expected a view_update, got {answer:?}");
-    };
-    assert_eq!(update.changed.len(), 1);
-    assert!(update.removed.is_empty());
-    // The caller's refresh applies it.
+
+    // Removed, vouching for its own old head.
+    let (router, told) = fake_x(library::HostProof {
+        head: v3.head.clone(),
+        fresh: vec![
+            sign(&x, &v3, now, now + 900),
+            sign(&y, &v3, now - 1000, now - 100),
+        ],
+    })
+    .await;
+    let held = view::refresh(&ks, &asker, false).await.unwrap();
+    assert_eq!(held.version(), StateVersion(4), "from Y, vouched for by Z");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(told.load(std::sync::atomic::Ordering::SeqCst), 0);
+    router.shutdown().await.unwrap();
+
+    // Removed, showing the current head and the others' current words.
+    let mut stale = view::read(&ks, root).unwrap().unwrap();
+    stale.view = v3.view_for(w.caller.node_id(), None, None);
+    stale.fresh = Default::default();
+    view::write(&ks, root, &stale).unwrap();
+    let (router, told) = fake_x(library::HostProof {
+        head: v4.head.clone(),
+        fresh: vec![sign(&y, &v4, now, now + 900), sign(&z, &v4, now, now + 900)],
+    })
+    .await;
     let held = view::refresh(&ks, &asker, false).await.unwrap();
     assert_eq!(held.version(), StateVersion(4));
-    let whole = w.caller_keystore(true);
-    let fetched = view::refresh(&whole, &asker, true).await.unwrap();
-    assert_eq!(held.view, fetched.view);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(told.load(std::sync::atomic::Ordering::SeqCst), 0);
+    router.shutdown().await.unwrap();
+
+    // Listed but lagging: the caller is at version 5 (X, Y, Z listed), and
+    // X shows version 3's head, which lists it, with its own and Y's
+    // current words for it.
+    let v5 = w.policy(5, |p| p.directories = all.clone());
+    let mut ahead = view::read(&ks, root).unwrap().unwrap();
+    ahead.view = v5.view_for(w.caller.node_id(), None, None);
+    view::write(&ks, root, &ahead).unwrap();
+    let (router, told) = fake_x(library::HostProof {
+        head: v3.head.clone(),
+        fresh: vec![sign(&y, &v3, now, now + 900), sign(&x, &v3, now, now + 900)],
+    })
+    .await;
+    // Nobody can give version 5 (Y and Z hold 4): the refresh fails, and X
+    // was told nothing.
+    assert!(view::refresh(&ks, &asker, false).await.is_err());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(told.load(std::sync::atomic::Ordering::SeqCst), 0);
+    router.shutdown().await.unwrap();
+    for r in routers {
+        r.shutdown().await.unwrap();
+    }
     endpoint.close().await;
 }
 
@@ -667,8 +778,7 @@ async fn a_signed_in_person_no_role_matches_is_told_so() {
 }
 
 /// A caller holding an empty view at the directory's newest version gets
-/// its entries on a refresh: the directory answers `current` only for the
-/// view it would send, not for any view at that version.
+/// its entries on a refresh: a view always travels whole (card 45).
 #[tokio::test]
 async fn an_empty_view_at_the_newest_version_is_answered_whole() {
     let w = World::new();

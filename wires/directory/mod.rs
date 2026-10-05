@@ -1,32 +1,33 @@
 //! The **directory** role (card 36): where the network's policy lives.
 //!
 //! A directory is a node the root-signed head lists in `directories`. It
-//! holds the newest policy (`directory.redb`), signs a freshness timestamp
-//! for it every `settings.beat_secs`, takes a newer policy from anyone whose
-//! head the root signed (the admin publishes each edit to every directory;
-//! the first directory starts empty and takes the first), follows the
-//! other directories as a replica, and answers hosts and callers. **It never
+//! holds the newest policy (its `policy.json`, nothing more), signs a
+//! freshness timestamp for it every `settings.beat_secs`, takes a newer
+//! policy from anyone whose head the root signed (the admin publishes each
+//! edit to every directory; the first directory starts empty and takes the
+//! first), and answers hosts and callers. Directories don't follow each
+//! other (card 45): one that missed a publish holds the policy before it
+//! until a publish reaches it. **It never
 //! decides a call:** hosts decide from their own copy. But a caller tells a
 //! host nothing without a directory's current `Fresh` for the head that host
 //! holds (card 49), so with every directory down calls stop within
 //! `fresh_secs`. It is trusted for availability and freshness only:
 //! everything it serves is root-signed.
 //!
-//! It is a mode on its own ALPNs (`wires/directory/2`,
-//! `wires/directory-sub/2`), not a native service: hosts aren't people, and
+//! It is a mode on its own ALPNs (`wires/directory/3`,
+//! `wires/directory-sub/3`), not a native service: hosts aren't people, and
 //! a host's checks aren't calls to log. `wires serve` runs it when the policy
 //! it holds lists its node (or, holding none yet, its network string does);
 //! `wires directory serve` runs it alone.
 //!
-//! - [`db`] — `directory.redb`: heads, items, the current index, freshness.
-//! - [`node`] — the [`Directory`](node::Directory): accept, beat, answer.
-//! - [`serve`] — both ALPNs, the beat and replica loops,
-//!   `wires directory serve`.
-//! - [`sub_policy`] — a host's `policy` subscription: the whole policy
-//!   once, then a delta per new head, and a `fresh` beat (card 36c).
-//! - [`sub_view`] — a caller's `view` subscription (card 37).
-//! - [`wire`] — frame I/O, and [`ask`](wire::ask): one request to a
-//!   directory, for every other role.
+//! - [`node`] — the [`Directory`](node::Directory): accept, beat, prove,
+//!   answer.
+//! - [`serve`] — both ALPNs, the beat loop, `wires directory serve`.
+//! - [`sub_policy`] — a host's subscription: the whole policy whenever it
+//!   is newer, else a `fresh` beat.
+//! - [`wire`] — frame I/O, [`ask`](wire::ask) (one request, for a host),
+//!   and [`open`](wire::open) (a directory's proof, read before a caller
+//!   presents its token).
 //!
 //! ```text
 //! wires directory add workbench=3ef7…   # admin: list a node as a directory
@@ -34,11 +35,9 @@
 //! wires directory serve             # on that node, when it hosts nothing
 //! ```
 
-pub mod db;
 pub mod node;
 pub mod serve;
 pub mod sub_policy;
-pub mod sub_view;
 pub mod wire;
 
 use anyhow::Result;

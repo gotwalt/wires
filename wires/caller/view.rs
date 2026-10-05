@@ -28,8 +28,17 @@
 //!   When the host's proof or `HelloAck` reports a newer head, the caller
 //!   records it ([`note_seen`]) and refreshes; a name not in the view is
 //!   asked of a directory with `resolve` before the call fails.
-//! - `wires mcp`, the gateway and `inbox --wait` hold a subscription
-//!   ([`follow`]): the whole view, then an update per new head.
+//! - `wires mcp` and `inbox --wait` ask again every minute ([`poll`]); the
+//!   gateway asks for a web user's view at their first request after a
+//!   minute ([`fetch`]).
+//!
+//! A view always travels whole (card 45). And a caller presents its ID
+//! token to a directory only once that directory has shown it is current,
+//! by the rule a host is held to (card 49): its head, no older than the
+//! view's, that lists it, and a current `Fresh` for that head from another
+//! directory ([`ask_proven`], [`directory_vouched`]). So a directory the
+//! admin removed, or one that missed the edit, is told nothing once its
+//! words have lapsed.
 //!
 //! A node that holds the whole policy (the admin's, a host's, a
 //! directory's) cuts its view from its own copy instead of asking
@@ -41,15 +50,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::Endpoint;
 use library::{
-    DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, Fresh, FreshSet, IdToken, NodeId,
-    ServiceName, SignedEntry, StateVersion, SubFrame, SubRequest, SubscriptionKind, View,
-    ViewDigest,
+    DirectoryAnswer, DirectoryRequest, Fresh, FreshSet, HostProof, IdToken, NodeId, ServiceName,
+    SignedEntry, StateVersion, View,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::admin::keystore::{Keystore, write_private};
 use crate::clock::now_unix;
-use crate::directory::wire::{self, ask};
+use crate::directory::wire;
 use crate::host::transport;
 use crate::policy::store;
 
@@ -69,8 +77,10 @@ pub(crate) const VIEW_MAX_AGE_SECS: i64 = 24 * 60 * 60;
 /// How long a refresh spends asking, all directories together.
 pub(crate) const REFRESH_BUDGET: Duration = Duration::from_secs(8);
 
-/// The longest a subscriber waits between two attempts to follow.
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// How often a long-running caller (`wires mcp`, `wires inbox --wait`, the
+/// gateway for each web user) asks for its view again: a grant or a
+/// revocation reaches it within this.
+pub(crate) const POLL: Duration = Duration::from_secs(60);
 
 /// `view.json`: the view, the newest `Fresh` per directory seen for it, when
 /// a directory last vouched for it, and the newest head version a host
@@ -254,124 +264,200 @@ pub(crate) fn directories(ks: &Keystore, root: NodeId, me: NodeId) -> Vec<NodeId
 #[error("a directory said this node is not admitted to the network")]
 pub(crate) struct NotAdmitted;
 
-/// A directory's `denied {reason}`, as an error (so [`refresh`] can tell a
-/// refusal of admission from a directory that couldn't be reached).
-#[derive(Debug, thiserror::Error)]
-#[error("refused: {0}")]
-pub(crate) struct Refused(pub(crate) String);
-
-impl Refused {
-    /// Whether the directory refused admission.
-    pub(crate) fn is_not_admitted(e: &anyhow::Error) -> bool {
-        e.downcast_ref::<Refused>()
-            .is_some_and(|r| r.0 == crate::host::gate::NOT_ADMITTED)
-    }
+/// What the asking in [`ask_proven`] came to when no directory gave an
+/// answer that was taken: why each failed, and whether one refused this
+/// node's admission.
+#[derive(Debug, Default)]
+pub(crate) struct Unanswered {
+    /// One line per directory.
+    pub(crate) failures: Vec<String>,
+    /// A directory whose proof checked out answered
+    /// [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED).
+    pub(crate) not_admitted: bool,
 }
 
-/// What a directory answered a `view` request with, verified.
-#[allow(clippy::large_enum_variant)] // one per request, moved once
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Fetched {
-    /// A whole view, verified under the root, with a `Fresh` that vouches
-    /// for its head.
-    View(View, Fresh),
-    /// The view held is current: a `Fresh` for its head.
-    Current(Fresh),
-}
-
-/// Ask directory `dir` for this node's view (presenting `id_token`, which
-/// is what admits it), holding `held` (whose version it names as `have`), or the
-/// entries matching `query`. A `view_update` is applied to `held`
-/// ([`View::apply`]: each entry verified, none older than held) and comes
-/// back as the whole new view. A `current` answer is only taken for a
-/// `held` head its `Fresh` vouches for, current at `now`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn ask_view(
-    endpoint: &Endpoint,
-    dir: NodeId,
-    id_token: Option<IdToken>,
+/// Whether directory `dir` may be told this caller's token, from its
+/// `proof` (card 45): it holds a head the root signed, unexpired, that
+/// lists `dir` as a directory; that head is no older than the caller's view
+/// (`held`, when it holds one; at its version, the same head); and a
+/// current `Fresh` from a directory other than `dir` vouches for it (or
+/// from `dir`, when the head lists it alone) — the proof's own, or one in
+/// `pool` (what the caller's view holds, and what every other directory
+/// asked in the same round showed). The rule a host is held to (card 49,
+/// [`HostProof::check`]).
+pub(crate) fn directory_vouched(
+    proof: &HostProof,
+    pool: &FreshSet,
     root: NodeId,
-    held: Option<&View>,
-    query: Option<String>,
+    held: Option<&library::SignedPolicyHead>,
+    dir: NodeId,
     now: i64,
-) -> Result<Fetched> {
-    // What is held, named exactly: the directory answers `current` or an
-    // update only for this view (one cut for another identity, or for none,
-    // gets the whole view).
-    let (have, held_digest) = match (&query, held) {
-        (None, Some(view)) => (view.head.head.version, Some(ViewDigest::of(view)?)),
-        _ => (StateVersion(0), None),
-    };
-    let request = DirectoryRequest::View {
-        have,
-        query,
-        held: held_digest,
-    };
-    match ask(endpoint, dir, id_token, &request).await? {
-        DirectoryAnswer::View { view, fresh } => {
-            view.verify(root)
-                .context("the directory's view does not verify")?;
-            fresh
-                .verify(&view.head)
-                .context("the directory's freshness doesn't vouch for its view")?;
-            Ok(Fetched::View(view, fresh))
-        }
-        DirectoryAnswer::ViewUpdate { update, fresh } => {
-            let base =
-                held.ok_or_else(|| anyhow!("an update for a view this node doesn't hold"))?;
-            let view = base
-                .apply(&update, root)
-                .context("the directory's view update doesn't apply")?;
-            fresh
-                .verify(&view.head)
-                .context("the directory's freshness doesn't vouch for its view")?;
-            Ok(Fetched::View(view, fresh))
-        }
-        DirectoryAnswer::Current { fresh } => {
-            let head = &held
-                .ok_or_else(|| anyhow!("`current` for a view this node doesn't hold"))?
-                .head;
-            fresh
-                .verify(head)
-                .context("the directory's freshness doesn't vouch for the held view")?;
-            if !fresh.is_current(now) {
-                bail!("the directory's freshness has lapsed");
-            }
-            Ok(Fetched::Current(fresh))
-        }
-        DirectoryAnswer::Denied { reason } => Err(Refused(reason).into()),
-        other => bail!("an unexpected answer to `view`: {other:?}"),
+) -> Result<()> {
+    if !proof.head.head.directories.contains(&dir) {
+        bail!(
+            "its policy (version {}) doesn't list it as a directory",
+            proof.head.head.version.0
+        );
     }
+    let mut set = pool.clone();
+    for f in &proof.fresh {
+        set.insert(f.clone(), now);
+    }
+    let combined = HostProof {
+        head: proof.head.clone(),
+        fresh: set.current_for(&proof.head, now),
+    };
+    match held {
+        Some(head) => {
+            combined.check(root, head, dir, now)?;
+        }
+        None => {
+            combined.head.verify(root)?;
+            combined.head.check_fresh(now)?;
+            combined.vouching(dir, now)?;
+        }
+    }
+    Ok(())
 }
 
-/// Ask directory `dir` for `service` alone (`resolve`): the one-entry view,
-/// or an empty one when this node may not use it (or it doesn't exist), and
-/// the `Fresh` that vouches for its head.
-pub(crate) async fn ask_resolve(
+/// Ask `dirs` for `request`, presenting `id_token` only to a directory whose
+/// proof checks out ([`directory_vouched`]): every directory is asked for
+/// its proof at once (`open`, nothing else); as each proof arrives, the
+/// `Fresh`es it carries join the pool the others are checked against, and
+/// every directory whose proof now checks out is sent the token and the
+/// request, one at a time, until `take` accepts an answer. A directory
+/// whose proof never checks out was told nothing but `open`. Nothing waits
+/// for the slowest directory once one has answered.
+pub(crate) async fn ask_proven<T>(
     endpoint: &Endpoint,
-    dir: NodeId,
-    id_token: Option<IdToken>,
     root: NodeId,
-    service: &ServiceName,
-) -> Result<(View, Fresh)> {
-    let request = DirectoryRequest::Resolve {
-        service: service.clone(),
-    };
-    match ask(endpoint, dir, id_token, &request).await? {
-        DirectoryAnswer::View { view, fresh } => {
+    dirs: &[NodeId],
+    held: Option<&HeldView>,
+    id_token: Option<IdToken>,
+    request: &DirectoryRequest,
+    mut take: impl FnMut(NodeId, DirectoryAnswer, &FreshSet) -> Result<T>,
+) -> std::result::Result<T, Unanswered> {
+    let mut asked = tokio::task::JoinSet::new();
+    for &dir in dirs {
+        let endpoint = endpoint.clone();
+        asked.spawn(async move { (dir, wire::open(&endpoint, dir).await) });
+    }
+    let mut pool = held.map(|h| h.fresh.clone()).unwrap_or_default();
+    let mut waiting: Vec<(NodeId, wire::Opened)> = Vec::new();
+    let mut out = Unanswered::default();
+    while let Some(joined) = asked.join_next().await {
+        let Ok((dir, opened)) = joined else { continue };
+        match opened {
+            Ok(o) => {
+                let now = now_unix();
+                for f in &o.proof.fresh {
+                    pool.insert(f.clone(), now);
+                }
+                waiting.push((dir, o));
+            }
+            Err(e) => out.failures.push(format!("{}: {e:#}", dir.short())),
+        }
+        // Every directory the pool now vouches for, in turn.
+        let mut i = 0;
+        while i < waiting.len() {
+            let (dir, o) = &waiting[i];
+            let vouched = directory_vouched(
+                &o.proof,
+                &pool,
+                root,
+                held.map(|h| &h.view.head),
+                *dir,
+                now_unix(),
+            );
+            if vouched.is_err() {
+                i += 1;
+                continue;
+            }
+            let (dir, o) = waiting.remove(i);
+            match o.ask(id_token.clone(), request).await {
+                Ok(DirectoryAnswer::Denied { reason }) => {
+                    out.not_admitted |= reason == crate::host::gate::NOT_ADMITTED;
+                    out.failures
+                        .push(format!("{}: refused: {reason}", dir.short()));
+                }
+                Ok(answer) => match take(dir, answer, &pool) {
+                    Ok(t) => return Ok(t),
+                    Err(e) => out.failures.push(format!("{}: {e:#}", dir.short())),
+                },
+                Err(e) => out.failures.push(format!("{}: {e:#}", dir.short())),
+            }
+        }
+    }
+    let now = now_unix();
+    for (dir, o) in waiting {
+        let why = directory_vouched(&o.proof, &pool, root, held.map(|h| &h.view.head), dir, now)
+            .err()
+            .map_or_else(|| "it lapsed".to_string(), |e| format!("{e:#}"));
+        tracing::debug!(directory = %dir.hex(), "told nothing: {why}");
+        out.failures.push(format!(
+            "{}: could not show a current policy ({why}); nothing was sent to it",
+            dir.short()
+        ));
+    }
+    Err(out)
+}
+
+/// Ask `dirs` (never this node) for this node's whole view, presenting
+/// `id_token` only to a directory that has shown it is current
+/// ([`ask_proven`]): the first view that verifies, whose `Fresh` vouches
+/// for its head, and that is no older than `held`. It keeps what `held` had
+/// seen from each directory, and every `Fresh` the directories showed.
+/// Errors when none gave one, with [`NotAdmitted`] as its context when a
+/// directory refused this node's admission.
+pub(crate) async fn fetch(
+    endpoint: &Endpoint,
+    root: NodeId,
+    dirs: &[NodeId],
+    held: Option<&HeldView>,
+    id_token: Option<IdToken>,
+) -> Result<HeldView> {
+    let now = now_unix();
+    let request = DirectoryRequest::View { query: None };
+    let taken = ask_proven(
+        endpoint,
+        root,
+        dirs,
+        held,
+        id_token,
+        &request,
+        |_, answer, pool| {
+            let DirectoryAnswer::View { view, fresh } = answer else {
+                bail!("an unexpected answer to `view`: {answer:?}");
+            };
             view.verify(root)
                 .context("the directory's view does not verify")?;
             fresh
                 .verify(&view.head)
                 .context("the directory's freshness doesn't vouch for its view")?;
-            if view.entries.iter().any(|e| e.name != *service) {
-                bail!("the directory resolved {service} to another service");
+            if let Some(old) = held
+                && view.head.head.version < old.version()
+            {
+                bail!("an older view (version {})", view.head.head.version.0);
             }
-            Ok((view, fresh))
+            let mut fetched = HeldView::fetched(view, Some(fresh), now).keeping(held, now);
+            for f in pool.iter() {
+                fetched.fresh.insert(f.clone(), now);
+            }
+            Ok(fetched)
+        },
+    )
+    .await;
+    taken.map_err(|out| {
+        let failed = anyhow!(
+            "no directory gave this node its view ({})",
+            out.failures.join("; ")
+        );
+        if out.not_admitted {
+            failed.context(NotAdmitted)
+        } else {
+            failed
         }
-        DirectoryAnswer::Denied { reason } => Err(Refused(reason).into()),
-        other => bail!("an unexpected answer to `resolve`: {other:?}"),
-    }
+    })
 }
 
 /// Who this node is, for a refresh: its endpoint, the network's root, and
@@ -389,8 +475,8 @@ pub(crate) struct Asker<'a> {
 ///
 /// - a node holding the whole policy (`policy.json`: the admin, a host, a
 ///   directory) cuts its view from that, for its own verified identity;
-/// - any other asks the directories in turn ([`directories`]): the first
-///   whole view, or `current` for the one held, settles it. `forget`
+/// - any other asks the directories ([`directories`], [`fetch`]): the
+///   first whole view from one whose proof checks out settles it. `forget`
 ///   drops the held view first (a new sign-in: the old entries were for
 ///   someone else).
 ///
@@ -427,71 +513,16 @@ pub(crate) async fn refresh(ks: &Keystore, asker: &Asker<'_>, forget: bool) -> R
             )
         });
     }
-    let mut failures = Vec::new();
-    let mut not_admitted = false;
-    for dir in dirs {
-        let base = held.as_ref().map(|h| &h.view);
-        let mut asked = ask_view(
-            asker.endpoint,
-            dir,
-            asker.id_token.clone(),
-            root,
-            base,
-            None,
-            now,
-        )
-        .await;
-        // An update that doesn't apply to what is held: the whole view.
-        if asked.is_err() && base.is_some() {
-            asked = ask_view(
-                asker.endpoint,
-                dir,
-                asker.id_token.clone(),
-                root,
-                None,
-                None,
-                now,
-            )
-            .await;
-        }
-        match asked {
-            Ok(Fetched::View(view, fresh)) => {
-                let fetched = HeldView::fetched(view, Some(fresh), now).keeping(held.as_ref(), now);
-                if let Some(old) = &held
-                    && fetched.version() < old.version()
-                {
-                    failures.push(format!(
-                        "{}: an older view (version {})",
-                        dir.short(),
-                        fetched.version().0
-                    ));
-                    continue;
-                }
-                write(ks, root, &fetched)?;
-                return Ok(fetched);
-            }
-            Ok(Fetched::Current(fresh)) => {
-                let mut current = held.clone().expect("current is only taken for a held view");
-                current.fresh.insert(fresh, now);
-                current.checked = now;
-                write(ks, root, &current)?;
-                return Ok(current);
-            }
-            Err(e) => {
-                not_admitted |= Refused::is_not_admitted(&e);
-                failures.push(format!("{}: {e:#}", dir.short()));
-            }
-        }
-    }
-    let failed = anyhow!(
-        "no directory gave this node its view ({})",
-        failures.join("; ")
-    );
-    Err(if not_admitted {
-        failed.context(NotAdmitted)
-    } else {
-        failed
-    })
+    let fetched = fetch(
+        asker.endpoint,
+        root,
+        &dirs,
+        held.as_ref(),
+        asker.id_token.clone(),
+    )
+    .await?;
+    write(ks, root, &fetched)?;
+    Ok(fetched)
 }
 
 /// Refuse an expired view, saying what to do about it.
@@ -597,233 +628,118 @@ pub(crate) async fn resolve(
 ) -> Result<Option<HeldView>> {
     let root = asker.root;
     let me = transport::to_node_id(&asker.endpoint.id());
-    let mut failures = Vec::new();
-    for dir in directories(ks, root, me) {
-        match ask_resolve(asker.endpoint, dir, asker.id_token.clone(), root, service).await {
-            Ok((view, fresh)) => {
-                note_seen(ks, root, view.head.head.version);
-                if view.entries.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(HeldView::fetched(view, Some(fresh), now_unix())));
-            }
-            Err(e) => failures.push(format!("{}: {e:#}", dir.short())),
-        }
-    }
-    if failures.is_empty() {
+    let dirs = directories(ks, root, me);
+    if dirs.is_empty() {
         return Ok(None);
     }
-    bail!("no directory resolved {service} ({})", failures.join("; "))
+    let held = read(ks, root).ok().flatten();
+    let request = DirectoryRequest::Resolve {
+        service: service.clone(),
+    };
+    let found = ask_proven(
+        asker.endpoint,
+        root,
+        &dirs,
+        held.as_ref(),
+        asker.id_token.clone(),
+        &request,
+        |_, answer, _| {
+            let DirectoryAnswer::View { view, fresh } = answer else {
+                bail!("an unexpected answer to `resolve`: {answer:?}");
+            };
+            view.verify(root)
+                .context("the directory's view does not verify")?;
+            fresh
+                .verify(&view.head)
+                .context("the directory's freshness doesn't vouch for its view")?;
+            if view.entries.iter().any(|e| e.name != *service) {
+                bail!("the directory resolved {service} to another service");
+            }
+            Ok((view, fresh))
+        },
+    )
+    .await;
+    match found {
+        Ok((view, fresh)) => {
+            note_seen(ks, root, view.head.head.version);
+            if view.entries.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(HeldView::fetched(view, Some(fresh), now_unix())))
+        }
+        Err(out) => bail!(
+            "no directory resolved {service} ({})",
+            out.failures.join("; ")
+        ),
+    }
 }
 
-/// Where a subscriber's view goes as it changes.
+/// Where a polled view goes as it changes.
 pub(crate) type ViewWatch = tokio::sync::watch::Receiver<Option<Arc<HeldView>>>;
 
-/// What a [`follow`] subscription needs.
-pub(crate) struct Follow {
+/// What a [`poll`] needs.
+pub(crate) struct Poll {
     /// A bound endpoint for this node (kept open by the caller).
     pub(crate) endpoint: Endpoint,
     /// The network's root key.
     pub(crate) root: NodeId,
-    /// The ID token to present at each (re)subscription: read afresh, so a
-    /// new `wires login` takes effect at the next one.
+    /// The ID token to present at each ask: read afresh, so a new `wires
+    /// login` takes effect at the next one.
     pub(crate) id_token: Arc<dyn Fn() -> Option<IdToken> + Send + Sync>,
-    /// The view to start from (and to fall back on while no directory
-    /// answers).
+    /// The view to start from (and to keep while no directory answers).
     pub(crate) initial: Option<HeldView>,
     /// Directories to ask while the view names none.
     pub(crate) fallback: Vec<NodeId>,
-    /// Where to keep the view as it changes (`view.json`), if anywhere: a
-    /// gateway's per-user views stay in memory.
+    /// Where to keep the view as it changes (`view.json`), if anywhere.
     pub(crate) persist: Option<Arc<Keystore>>,
+    /// How often to ask ([`POLL`]); while it holds no view, sooner (from
+    /// 1 s, doubling up to this).
+    pub(crate) every: Duration,
 }
 
-/// Follow this node's view on `wires/directory-sub/2` until the returned
-/// task is aborted: the first directory that answers, then the next when it
-/// goes (with a growing pause, at most [`MAX_BACKOFF`]). Every change (a new
-/// view, an update applied with [`View::apply`], a new `Fresh`) is sent on
-/// the returned channel; an update that doesn't apply ends that
-/// subscription, and the next asks for the whole view again. A stream
-/// silent past [`silence`] is taken for dead. A directory that answers
-/// `denied` (this node is not admitted, or the directory is no longer one,
-/// or busy), at once or ending the stream, is passed over for the next one
-/// at once; a round that no directory served waits the growing pause, so
-/// no directory is asked again in a tight loop.
-pub(crate) fn follow(f: Follow) -> (ViewWatch, tokio::task::JoinHandle<()>) {
-    let (tx, rx) = tokio::sync::watch::channel(f.initial.clone().map(Arc::new));
+/// Ask for this node's view every [`Poll::every`] until the returned task is
+/// aborted ([`fetch`]: only of a directory whose proof checks out), and send
+/// each new one on the returned channel. A round no directory answers keeps
+/// the view as it is.
+pub(crate) fn poll(p: Poll) -> (ViewWatch, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = tokio::sync::watch::channel(p.initial.clone().map(Arc::new));
     let task = tokio::spawn(async move {
-        let root = f.root;
-        let me = transport::to_node_id(&f.endpoint.id());
-        let mut held = f.initial.clone();
-        let mut backoff = Duration::from_secs(1);
+        let me = transport::to_node_id(&p.endpoint.id());
+        let mut held = p.initial.clone();
+        let mut pause = Duration::from_secs(1).min(p.every);
+        if held.is_some() {
+            tokio::time::sleep(p.every).await;
+        }
         loop {
             let dirs: Vec<NodeId> = held
                 .as_ref()
                 .map(|h| h.directories().to_vec())
                 .filter(|d| !d.is_empty())
-                .unwrap_or_else(|| f.fallback.clone())
+                .unwrap_or_else(|| p.fallback.clone())
                 .into_iter()
                 .filter(|d| *d != me)
                 .collect();
-            for dir in dirs {
-                match follow_once(&f, dir, root, &mut held, &tx).await {
-                    Ok(Ended::Closed) => backoff = Duration::from_secs(1),
-                    Ok(Ended::Denied(reason)) => tracing::info!(
-                        directory = %dir.hex(),
-                        "view subscription refused: {reason}; trying the next directory"
-                    ),
-                    Err(e) => tracing::debug!(directory = %dir.hex(), "view subscription: {e:#}"),
+            match fetch(&p.endpoint, p.root, &dirs, held.as_ref(), (p.id_token)()).await {
+                Ok(mut next) => {
+                    next.seen = held.as_ref().map_or(StateVersion(0), |h| h.seen);
+                    if let Some(ks) = &p.persist
+                        && let Err(e) = write(ks, p.root, &next)
+                    {
+                        tracing::warn!("could not keep view.json in step: {e:#}");
+                    }
+                    held = Some(next.clone());
+                    if tx.send(Some(Arc::new(next))).is_err() {
+                        return;
+                    }
                 }
-                if tx.is_closed() {
-                    return;
-                }
+                Err(e) => tracing::debug!("asking for the view again: {e:#}"),
             }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF);
+            let wait = if held.is_some() { p.every } else { pause };
+            pause = (pause * 2).min(p.every);
+            tokio::time::sleep(wait).await;
         }
     });
     (rx, task)
-}
-
-/// How one view subscription ended.
-#[derive(Debug, PartialEq, Eq)]
-enum Ended {
-    /// After at least one frame, the stream closed, broke, or went silent
-    /// past [`silence`] (or nobody listens to the view any more).
-    Closed,
-    /// The directory answered `denied`, at once or ending the stream.
-    Denied(String),
-}
-
-/// How long a view subscription may stay silent once it has answered: the
-/// held `Fresh`'s lifetime (a live directory beats well within it, since
-/// `fresh_secs >= beat_secs`) plus that again, at most 10 s, of slack; with
-/// none held, two default beats and 10 s. (A caller's view carries no
-/// settings, so the `Fresh` is what says how often to expect one.)
-fn silence(held: Option<&HeldView>) -> Duration {
-    let newest = held.and_then(|h| h.fresh.iter().max_by_key(|f| (f.version, f.until)));
-    match newest {
-        Some(f) => {
-            let span = u64::try_from(f.until.saturating_sub(f.at))
-                .unwrap_or(0)
-                .max(1);
-            Duration::from_secs(span + span.min(10))
-        }
-        None => Duration::from_secs(2 * u64::from(library::DEFAULT_BEAT_SECS) + 10),
-    }
-}
-
-/// One subscription to `dir`, until it ends: apply every frame to `held`
-/// and announce the result. The first frame must come within
-/// [`wire::FRAME_TIMEOUT`], each later one within [`silence`]. `Err`: it
-/// never answered, or sent a frame that can't be taken.
-async fn follow_once(
-    f: &Follow,
-    dir: NodeId,
-    root: NodeId,
-    held: &mut Option<HeldView>,
-    tx: &tokio::sync::watch::Sender<Option<Arc<HeldView>>>,
-) -> Result<Ended> {
-    let addr = transport::endpoint_addr(&dir, &[], None)?;
-    let conn = tokio::time::timeout(
-        wire::DIAL_TIMEOUT,
-        f.endpoint.connect(addr, DIRECTORY_SUB_ALPN),
-    )
-    .await
-    .map_err(|_| anyhow!("no answer within {:?}", wire::DIAL_TIMEOUT))?
-    .map_err(|e| anyhow!("dialing {}…: {e}", dir.short()))?;
-    let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
-    let hello = SubRequest::Hello {
-        id_token: (f.id_token)(),
-    };
-    let subscribe = SubRequest::Subscribe {
-        kind: SubscriptionKind::View,
-        have: held.as_ref().map_or(StateVersion(0), HeldView::version),
-    };
-    wire::write(&mut send, &hello.encode()?).await?;
-    wire::write(&mut send, &subscribe.encode()?).await?;
-    let result = async {
-        let mut answered = false;
-        loop {
-            let wait = if answered {
-                silence(held.as_ref())
-            } else {
-                wire::FRAME_TIMEOUT
-            };
-            let frame = match tokio::time::timeout(wait, wire::read_sub_frame(&mut recv)).await {
-                Ok(Ok(Some(frame))) => frame,
-                Ok(Ok(None)) if !answered => bail!("the directory closed without answering"),
-                Ok(Err(e)) if !answered => return Err(e),
-                Err(_) if !answered => bail!("no answer within {wait:?}"),
-                Ok(Ok(None)) => return Ok(Ended::Closed),
-                Ok(Err(e)) => {
-                    tracing::debug!(directory = %dir.hex(), "view subscription broke: {e:#}");
-                    return Ok(Ended::Closed);
-                }
-                Err(_) => {
-                    tracing::info!(
-                        directory = %dir.hex(),
-                        "view subscription silent for {wait:?}; following again"
-                    );
-                    return Ok(Ended::Closed);
-                }
-            };
-            let now = now_unix();
-            let next = match frame {
-                SubFrame::View { view, fresh } => {
-                    view.verify(root)?;
-                    fresh.verify(&view.head)?;
-                    let mut next =
-                        HeldView::fetched(view, Some(fresh), now).keeping(held.as_ref(), now);
-                    next.seen = held.as_ref().map_or(StateVersion(0), |h| h.seen);
-                    next
-                }
-                SubFrame::ViewUpdate { update, fresh } => {
-                    let Some(base) = held.as_ref() else {
-                        bail!("an update before any view");
-                    };
-                    let view = base
-                        .view
-                        .apply(&update, root)
-                        .context("an update that doesn't apply; subscribing again")?;
-                    fresh.verify(&view.head)?;
-                    let mut set = base.fresh.clone();
-                    set.insert(fresh, now);
-                    HeldView {
-                        view,
-                        fresh: set,
-                        checked: now,
-                        seen: base.seen,
-                    }
-                }
-                SubFrame::Fresh { fresh } => {
-                    let Some(base) = held.as_ref() else {
-                        bail!("a beat before any view");
-                    };
-                    fresh.verify(&base.view.head)?;
-                    let mut next = base.clone();
-                    next.fresh.insert(fresh, now);
-                    next.checked = now;
-                    next
-                }
-                SubFrame::Denied { reason } => return Ok(Ended::Denied(reason)),
-                other => bail!("an unexpected frame for a view: {other:?}"),
-            };
-            answered = true;
-            if let Some(ks) = &f.persist
-                && let Err(e) = write(ks, root, &next)
-            {
-                tracing::warn!("could not keep view.json in step: {e:#}");
-            }
-            *held = Some(next.clone());
-            if tx.send(Some(Arc::new(next))).is_err() {
-                return Ok(Ended::Closed);
-            }
-        }
-    }
-    .await;
-    conn.close(0u32.into(), b"done");
-    result
 }
 
 #[cfg(test)]
@@ -930,212 +846,62 @@ mod tests {
         assert_eq!(directories(&ks, r, me), vec![listed]);
     }
 
-    // -----------------------------------------------------------------------
-    // Following: a silent or refusing directory (a fake one, on loopback)
-    // -----------------------------------------------------------------------
-
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use iroh::address_lookup::memory::MemoryLookup;
-
-    /// What a fake directory does on each view subscription.
-    #[derive(Clone, Copy)]
-    enum Script {
-        /// The view once, then nothing, the stream held open.
-        ViewThenSilence,
-        /// The view, then `denied`.
-        ViewThenDenied,
-        /// `denied` at once.
-        Denied,
+    /// A directory's proof: its head and the `Fresh`es of `by`, current at
+    /// 1 000 for 900 s.
+    fn proof(p: &SignedPolicy, by: &[&NodeIdentity]) -> HostProof {
+        HostProof {
+            head: p.head.clone(),
+            fresh: by
+                .iter()
+                .map(|d| Fresh::sign(d, &p.head, 1_000, 1_900).unwrap())
+                .collect(),
+        }
     }
 
-    /// Nodes 53 and 54: the fake directories.
-    fn dir(i: u8) -> NodeIdentity {
-        NodeIdentity::from_seed([53 + i; 32])
-    }
-
-    /// [`signed`] at version 1, listing both fake directories.
-    fn listing() -> SignedPolicy {
-        let mut p = signed(1).to_policy().unwrap();
-        p.directories = vec![dir(0).node_id(), dir(1).node_id()];
+    /// `signed(version)` listing `dirs` as its directories.
+    fn listing(version: u64, dirs: &[&NodeIdentity]) -> SignedPolicy {
+        let mut p = signed(version).to_policy().unwrap();
+        p.directories = dirs.iter().map(|d| d.node_id()).collect();
         crate::testutil::signed_policy(&root(), p)
     }
 
-    /// A loopback endpoint for `who`, found through `book`, speaking `alpns`.
-    async fn endpoint(who: &NodeIdentity, book: &MemoryLookup, alpns: Vec<Vec<u8>>) -> Endpoint {
-        let ep = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .secret_key(transport::secret_key(who))
-            .address_lookup(book.clone())
-            .alpns(alpns)
-            .bind()
-            .await
-            .unwrap();
-        let socks: Vec<_> = ep
-            .bound_sockets()
-            .into_iter()
-            .map(crate::net::dialable)
-            .collect();
-        book.add_endpoint_info(transport::endpoint_addr(&who.node_id(), &socks, None).unwrap());
-        ep
-    }
-
-    /// Fake directory `i` playing `script` to every subscriber, its `Fresh`
-    /// good for `span` seconds; the count of subscriptions it took.
-    async fn fake_directory(
-        i: u8,
-        book: &MemoryLookup,
-        script: Script,
-        span: i64,
-    ) -> Arc<AtomicUsize> {
-        let ep = endpoint(&dir(i), book, vec![DIRECTORY_SUB_ALPN.to_vec()]).await;
-        let policy = listing();
-        let now = now_unix();
-        let fresh = Fresh::sign(&dir(i), &policy.head, now, now + span).unwrap();
-        let view = SubFrame::View {
-            view: policy.view_for(crate::testutil::any_node(), Some(&anyone()), None),
-            fresh,
-        };
-        let denied = SubFrame::Denied {
-            reason: "no longer a directory of this network".into(),
-        };
-        let taken = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&taken);
-        tokio::spawn(async move {
-            while let Some(incoming) = ep.accept().await {
-                let Ok(conn) = incoming.await else { continue };
-                count.fetch_add(1, Ordering::SeqCst);
-                let frames = match script {
-                    Script::ViewThenSilence => vec![view.clone()],
-                    Script::ViewThenDenied => vec![view.clone(), denied.clone()],
-                    Script::Denied => vec![denied.clone()],
-                };
-                tokio::spawn(async move {
-                    let Ok((mut send, mut recv)) = conn.accept_bi().await else {
-                        return;
-                    };
-                    let _hello = wire::read_sub_request(&mut recv).await;
-                    let _subscribe = wire::read_sub_request(&mut recv).await;
-                    for frame in frames {
-                        let _ = wire::write(&mut send, &frame.encode().unwrap()).await;
-                    }
-                    if matches!(script, Script::ViewThenSilence) {
-                        tokio::time::sleep(Duration::from_secs(3600)).await;
-                    }
-                    let _ = send.finish();
-                    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
-                });
-            }
-        });
-        taken
-    }
-
-    /// A follower for node 55 over `book`, starting from no view and the
-    /// fake directories.
-    async fn follower(book: &MemoryLookup) -> Follow {
-        let me = NodeIdentity::from_seed([55; 32]);
-        Follow {
-            endpoint: endpoint(&me, book, vec![]).await,
-            root: root().node_id(),
-            id_token: Arc::new(|| None),
-            initial: None,
-            fallback: vec![dir(0).node_id(), dir(1).node_id()],
-            persist: None,
-        }
-    }
-
-    /// The silence bound: the held `Fresh`'s lifetime plus that again, at
-    /// most 10 s; two default beats and 10 s with none.
+    /// Card 45: a directory is told a caller's token only on another
+    /// directory's current word for a head it is listed in, no older than
+    /// the caller's view: as a host is (card 49).
     #[test]
-    fn silence_follows_the_freshness_lifetime() {
-        let policy = listing();
-        let held = |span: i64| {
-            let fresh = Fresh::sign(&dir(0), &policy.head, 100, 100 + span).unwrap();
-            HeldView::fetched(
-                policy.view_for(crate::testutil::any_node(), None, None),
-                Some(fresh),
-                100,
-            )
-        };
-        assert_eq!(silence(Some(&held(1))), Duration::from_secs(2));
-        assert_eq!(silence(Some(&held(900))), Duration::from_secs(910));
-        assert_eq!(silence(None), Duration::from_secs(610));
-    }
-
-    /// A directory that answers and then goes silent (no beat within the
-    /// silence bound) ends the subscription, so the follower moves on,
-    /// rather than waiting on it forever.
-    #[tokio::test]
-    async fn a_silent_view_subscription_is_taken_for_dead() {
-        let book = MemoryLookup::new();
-        let _taken = fake_directory(0, &book, Script::ViewThenSilence, 1).await;
-        let f = follower(&book).await;
-        let (tx, _rx) = tokio::sync::watch::channel(None);
-        let mut held = None;
-        let ended = tokio::time::timeout(
-            Duration::from_secs(10),
-            follow_once(&f, dir(0).node_id(), root().node_id(), &mut held, &tx),
-        )
-        .await
-        .expect("ends within the silence bound")
-        .unwrap();
-        assert_eq!(ended, Ended::Closed);
-        assert_eq!(held.unwrap().version(), StateVersion(1));
-        f.endpoint.close().await;
-    }
-
-    /// A directory that ends the subscription with `denied` is passed over
-    /// at once for the next one, and not asked again meanwhile.
-    #[tokio::test]
-    async fn a_denied_view_subscription_moves_to_the_next_directory() {
-        let book = MemoryLookup::new();
-        let first = fake_directory(0, &book, Script::ViewThenDenied, 3600).await;
-        let second = fake_directory(1, &book, Script::ViewThenSilence, 3600).await;
-        let f = follower(&book).await;
-        let (tx, _rx) = tokio::sync::watch::channel(None);
-        let mut held = None;
-        let ended = follow_once(&f, dir(0).node_id(), root().node_id(), &mut held, &tx)
-            .await
-            .unwrap();
-        assert!(matches!(ended, Ended::Denied(r) if r.contains("no longer a directory")));
-        assert_eq!(first.load(Ordering::SeqCst), 1);
-
-        let endpoint = f.endpoint.clone();
-        let (_watch, task) = follow(f);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while second.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the second directory is followed");
-        tokio::time::sleep(Duration::from_millis(1_500)).await;
-        assert_eq!(
-            first.load(Ordering::SeqCst),
-            2,
-            "once more, then passed over"
+    fn a_directory_is_told_nothing_without_another_directorys_current_word() {
+        let (a, b, c) = (
+            NodeIdentity::from_seed([60; 32]),
+            NodeIdentity::from_seed([61; 32]),
+            NodeIdentity::from_seed([62; 32]),
         );
-        assert_eq!(second.load(Ordering::SeqCst), 1, "followed, and still");
-        task.abort();
-        endpoint.close().await;
-    }
-
-    /// When every directory refuses, the follower pauses between rounds (1
-    /// s, 2 s, …): a handful of attempts over seconds, never a tight loop.
-    #[tokio::test]
-    async fn a_follower_every_directory_refuses_backs_off() {
-        let book = MemoryLookup::new();
-        let first = fake_directory(0, &book, Script::Denied, 3600).await;
-        let second = fake_directory(1, &book, Script::Denied, 3600).await;
-        let f = follower(&book).await;
-        let endpoint = f.endpoint.clone();
-        let (_watch, task) = follow(f);
-        tokio::time::sleep(Duration::from_millis(3_500)).await;
-        task.abort();
-        // Rounds at about 0, 1 and 3 s.
-        for taken in [first, second] {
-            let n = taken.load(Ordering::SeqCst);
-            assert!((1..=4).contains(&n), "{n} subscriptions in 3.5 s");
-        }
-        endpoint.close().await;
+        let r = root().node_id();
+        let v3 = listing(3, &[&a, &b]);
+        let none = FreshSet::default();
+        let at = 1_500;
+        let ok = |proof: &HostProof, pool: &FreshSet, held: Option<&SignedPolicy>| {
+            directory_vouched(proof, pool, r, held.map(|p| &p.head), a.node_id(), at)
+        };
+        // Its own word alone: no (two directories listed).
+        assert!(ok(&proof(&v3, &[&a]), &none, None).is_err());
+        // Another's, in its proof or from the other directory asked.
+        assert!(ok(&proof(&v3, &[&a, &b]), &none, None).is_ok());
+        let mut pool = FreshSet::default();
+        pool.insert(Fresh::sign(&b, &v3.head, 1_000, 1_900).unwrap(), at);
+        assert!(ok(&proof(&v3, &[&a]), &pool, Some(&v3)).is_ok());
+        // Lapsed: no.
+        assert!(
+            directory_vouched(&proof(&v3, &[&a, &b]), &none, r, None, a.node_id(), 1_901).is_err()
+        );
+        // Behind the caller's view: no, whoever vouches.
+        let v4 = listing(4, &[&a, &b]);
+        assert!(ok(&proof(&v3, &[&a, &b]), &none, Some(&v4)).is_err());
+        // Removed from the directories (a head that no longer lists it, with
+        // the others' current words): no.
+        let v5 = listing(5, &[&b, &c]);
+        assert!(ok(&proof(&v5, &[&b, &c]), &none, Some(&v4)).is_err());
+        // The one directory: its own word is all there is.
+        let alone = listing(3, &[&a]);
+        assert!(ok(&proof(&alone, &[&a]), &none, None).is_ok());
     }
 }

@@ -1,166 +1,55 @@
-//! A host's `policy` subscription (card 36c), the directory side.
+//! A host's subscription to the policy (`wires/directory-sub/3`), the
+//! directory side.
 //!
-//! A host subscribes with the version it holds (`have`; 0: none). The
-//! directory sends, on one long-lived stream:
+//! A host (or another directory that is also a host) subscribes with the
+//! version it holds (`have`; 0: none). The directory sends, on one
+//! long-lived stream, at once and on every change of what it holds (a new
+//! head, or a beat every `settings.beat_secs`):
 //!
-//! - first, what brings it to the newest head ([`since`]): nothing but a
-//!   `fresh` beat when `have` is the newest; a `policy_update` (the new head,
-//!   the items changed and the keys removed, from
-//!   [`SignedPolicy::update_from`] against the head at `have` kept in
-//!   `directory.redb`) when `have` is one of the [`KEEP_HEADS`](super::db::KEEP_HEADS)
-//!   kept heads; the whole `policy` otherwise (`have` 0, too old, or unknown);
-//! - then a `policy_update` for every head the directory adopts (a publish,
-//!   or a replica catching up), each with its `Fresh`;
-//! - and a `fresh` beat every `settings.beat_secs` in between.
+//! - the whole `policy {policy, fresh}` when its head is newer than what
+//!   the subscriber has (its `have`, then the last policy sent it): there
+//!   are no deltas (card 45);
+//! - else `fresh {fresh}`, its `Fresh` for its own head, even when the
+//!   subscriber holds a newer head: so the subscriber learns this directory
+//!   is behind it, and follows another.
 //!
-//! A subscriber that can't apply an update subscribes anew with `have: 0`.
 //! The stream ends with `denied` when this node stops being a directory
 //! (it can no longer vouch), and the host fails over to another. Every
 //! head is checked as the subscription's opening was: one that bans the
 //! subscriber, or no longer names it as a host or a directory, ends the
 //! stream with `denied` too.
 //!
-//! Subscribers following the same head get the same bytes: each frame is
-//! encoded once per `(have, head, Fresh)` and shared ([`FrameCache`]), so a
-//! publish to a directory with a thousand hosts reads the older policy from
-//! the store and diffs it once, not a thousand times.
-//!
-//! `policy {have}` on `wires/directory/2` answers the same way
-//! ([`since`]), for a host's one-shot fetch.
+//! Every subscriber gets the same bytes: each frame is encoded once per
+//! head and `Fresh` ([`Current::frame`]), not once per subscriber.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, SendStream};
-use library::{Fresh, NodeId, PolicyUpdate, StateVersion, SubFrame};
+use library::{NodeId, StateVersion, SubFrame};
 
 use super::node::{Current, Directory, NOT_ADMITTED, VIEW_NOT_POLICY};
 use super::wire;
 
-/// What brings a holder of `have` to a directory's newest head.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum Since {
-    /// `have` is the newest (or newer than the directory's): nothing to send
-    /// but freshness.
-    Current,
-    /// The delta from the kept head at `have`.
-    Update(PolicyUpdate),
-    /// The whole policy: `have` is 0, older than every kept head, or not a
-    /// head the directory kept.
-    Whole,
-}
-
-/// What `c` (the directory's newest) is to a holder of `have`. See the
-/// module docs. A store that can't be read gives [`Since::Whole`].
-pub(crate) fn since(dir: &Directory, c: &Current, have: StateVersion) -> Since {
-    if have >= c.held.version() {
-        return Since::Current;
-    }
-    if have.0 == 0 {
-        return Since::Whole;
-    }
-    match dir.policy_at(have) {
-        Ok(Some(older)) => Since::Update(c.held.signed.update_from(&older)),
-        Ok(None) => Since::Whole,
-        Err(e) => {
-            tracing::warn!(
-                have = have.0,
-                "directory: reading a kept head failed: {e:#}"
-            );
-            Since::Whole
-        }
-    }
-}
-
-/// The frame a subscriber at `sent` gets for `c` and its `fresh`, and the
-/// version it then holds; `None` when it holds a newer head than the
-/// directory (it waits for the directory to catch up).
-fn next_frame(
-    dir: &Directory,
+/// The frame a subscriber that has `sent` gets for `c`: the whole policy
+/// when `c`'s head is newer, else the beat; and the version it then has.
+/// `None` when `c` holds no `Fresh`.
+pub(crate) fn next_frame(
     c: &Current,
-    fresh: &Fresh,
     sent: StateVersion,
-) -> Option<(SubFrame, StateVersion)> {
+) -> Result<Option<(Arc<Vec<u8>>, StateVersion)>> {
     let version = c.held.version();
-    if sent > version {
-        return None;
-    }
-    let frame = match since(dir, c, sent) {
-        Since::Current => SubFrame::Fresh {
-            fresh: fresh.clone(),
-        },
-        Since::Update(update) => SubFrame::PolicyUpdate {
-            update,
-            fresh: fresh.clone(),
-        },
-        Since::Whole => SubFrame::Policy {
-            policy: c.held.signed.clone(),
-            fresh: fresh.clone(),
-        },
-    };
-    Some((frame, version))
+    let whole = version > sent;
+    Ok(c.frame(whole)?
+        .map(|bytes| (bytes, if whole { version } else { sent })))
 }
 
-/// The encoded frames subscribers share: keyed by the version the
-/// subscriber held, the head it moves to, and the `Fresh` (by its `at`),
-/// the last few kept. See the module docs.
-#[derive(Debug, Default)]
-pub(crate) struct FrameCache {
-    /// `(have, head, fresh.at)` → the encoded frame, newest last.
-    frames: Mutex<Vec<(FrameKey, Arc<Vec<u8>>)>>,
-}
-
-/// What a cached frame is for.
-type FrameKey = (StateVersion, StateVersion, i64);
-
-/// How many encoded frames a directory keeps for its subscribers.
-const CACHED_FRAMES: usize = 8;
-
-impl FrameCache {
-    /// The encoded frame for a subscriber at `sent` (see [`next_frame`]),
-    /// from the cache or made and cached now.
-    fn frame(
-        &self,
-        dir: &Directory,
-        c: &Current,
-        fresh: &Fresh,
-        sent: StateVersion,
-    ) -> Result<Option<(Arc<Vec<u8>>, StateVersion)>> {
-        let version = c.held.version();
-        if sent > version {
-            return Ok(None);
-        }
-        let key = (sent, version, fresh.at);
-        let hit = self
-            .frames
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, bytes)| Arc::clone(bytes));
-        if let Some(bytes) = hit {
-            return Ok(Some((bytes, version)));
-        }
-        let Some((frame, to)) = next_frame(dir, c, fresh, sent) else {
-            return Ok(None);
-        };
-        let bytes = Arc::new(frame.encode()?);
-        let mut frames = self.frames.lock().unwrap_or_else(|e| e.into_inner());
-        frames.retain(|(k, _)| *k != key);
-        frames.push((key, Arc::clone(&bytes)));
-        let over = frames.len().saturating_sub(CACHED_FRAMES);
-        frames.drain(..over);
-        Ok(Some((bytes, to)))
-    }
-}
-
-/// Serve one host's `policy` subscription on `send` (the `hello` and the
-/// `subscribe {kind: policy, have}` already read, the host named by the
-/// held policy) until the host goes away, this node stops being a
-/// directory, or a new head bans the host or no longer names it as a host
-/// or directory: each ends the stream with `denied`. Takes one of the directory's subscriber slots, or
-/// refuses when the cap is reached.
+/// Serve one host's subscription on `send` (the `hello` and the
+/// `subscribe {have}` already read, the subscriber named by the held
+/// policy) until it goes away, this node stops being a directory, or a new
+/// head bans the subscriber or no longer names it as a host or directory:
+/// each ends the stream with `denied`. Takes one of the directory's
+/// subscriber slots, or refuses when the cap is reached.
 pub(crate) async fn serve(
     dir: &Directory,
     conn: &Connection,
@@ -184,10 +73,10 @@ pub(crate) async fn serve(
     loop {
         let snapshot = changes.borrow_and_update().clone();
         if let Some(c) = snapshot {
-            let Some(fresh) = c.fresh.clone() else {
+            if c.fresh.is_none() {
                 // The head no longer lists this node: it vouches for nothing.
                 return deny(send, "no longer a directory of this network".into()).await;
-            };
+            }
             if c.held.policy.bans_node(caller) {
                 tracing::info!(peer = %caller.hex(), "policy subscription ended: removed");
                 return deny(send, NOT_ADMITTED.into()).await;
@@ -195,7 +84,7 @@ pub(crate) async fn serve(
             if !dir.holds_whole(caller) {
                 return deny(send, VIEW_NOT_POLICY.into()).await;
             }
-            if let Some((bytes, to)) = dir.policy_frames.frame(dir, &c, &fresh, sent)? {
+            if let Some((bytes, to)) = next_frame(&c, sent)? {
                 wire::write(send, &bytes).await?;
                 sent = to;
             }
@@ -281,78 +170,68 @@ mod tests {
     }
 
     #[test]
-    fn a_policy_request_gets_a_delta_from_a_kept_head() {
+    fn a_policy_request_gets_the_whole_policy_unless_current() {
         let all = versions(3);
         let dir = directory(&all);
-        assert!(matches!(ask(&dir, 0), DirectoryAnswer::Policy { policy, .. } if policy == all[2]));
-        let DirectoryAnswer::PolicyUpdate { update, fresh } = ask(&dir, 1) else {
-            panic!("expected a policy_update");
-        };
-        assert_eq!(all[0].apply(&update, root().node_id()).unwrap(), all[2]);
-        fresh.verify(&all[2].head).unwrap();
+        for have in [0, 1, 2] {
+            let DirectoryAnswer::Policy { policy, fresh } = ask(&dir, have) else {
+                panic!("expected the whole policy from {have}");
+            };
+            assert_eq!(policy, all[2]);
+            fresh.verify(&all[2].head).unwrap();
+        }
         assert!(matches!(ask(&dir, 3), DirectoryAnswer::Current { .. }));
-        // Newer than the directory's own: nothing to send.
+        // Newer than the directory's own: nothing to send but its word.
         assert!(matches!(ask(&dir, 9), DirectoryAnswer::Current { .. }));
     }
 
     #[test]
-    fn a_head_no_longer_kept_gets_the_whole_policy() {
-        let n = super::super::db::KEEP_HEADS as u64 + 2;
-        let all = versions(n);
-        let dir = directory(&all);
-        assert!(matches!(ask(&dir, 1), DirectoryAnswer::Policy { .. }));
-        assert!(matches!(
-            ask(&dir, n - 1),
-            DirectoryAnswer::PolicyUpdate { .. }
-        ));
-    }
-
-    #[test]
-    fn subscribers_at_one_version_share_one_encoded_frame() {
+    fn subscribers_share_one_encoded_frame() {
         let all = versions(3);
         let dir = directory(&all);
         let c = dir.snapshot().unwrap();
-        let fresh = c.fresh.clone().unwrap();
-        let frame = |have: u64| {
-            dir.policy_frames
-                .frame(&dir, &c, &fresh, StateVersion(have))
-                .unwrap()
-        };
-        let (a, to) = frame(1).unwrap();
-        let (b, _) = frame(1).unwrap();
+        let (a, to) = next_frame(&c, StateVersion(1)).unwrap().unwrap();
+        let (b, _) = next_frame(&c, StateVersion(0)).unwrap().unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(to, StateVersion(3));
-        let Some((SubFrame::PolicyUpdate { update, .. }, _)) = SubFrame::decode(&a).unwrap() else {
-            panic!("expected a policy_update");
+        let Some((SubFrame::Policy { policy, .. }, _)) = SubFrame::decode(&a).unwrap() else {
+            panic!("expected the whole policy");
         };
-        assert_eq!(all[0].apply(&update, root().node_id()).unwrap(), all[2]);
-        // At the head: a beat. Ahead of it: nothing.
-        let (beat, _) = frame(3).unwrap();
-        assert!(matches!(
-            SubFrame::decode(&beat).unwrap(),
-            Some((SubFrame::Fresh { .. }, _))
-        ));
-        assert!(frame(4).is_none());
+        assert_eq!(policy, all[2]);
+        // At the head, and ahead of it: the beat, and the version stays.
+        for have in [3, 4] {
+            let (beat, to) = next_frame(&c, StateVersion(have)).unwrap().unwrap();
+            assert_eq!(to, StateVersion(have));
+            assert!(matches!(
+                SubFrame::decode(&beat).unwrap(),
+                Some((SubFrame::Fresh { .. }, _))
+            ));
+        }
     }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(16))]
 
-        /// From any version a subscriber may hold, what the directory sends
-        /// brings it to the newest head exactly.
+        /// From any version a subscriber may hold, the first frame brings it
+        /// to the newest head exactly, or says the directory's own head.
         #[test]
-        fn what_since_sends_always_reaches_the_newest(n in 1u64..6, have in 0u64..8) {
+        fn the_first_frame_always_reaches_the_newest(n in 1u64..6, have in 0u64..8) {
             let all = versions(n);
             let dir = directory(&all);
             let c = dir.snapshot().unwrap();
             let newest = &all[all.len() - 1];
-            match since(&dir, &c, StateVersion(have)) {
-                Since::Current => prop_assert!(have >= n),
-                Since::Whole => prop_assert_eq!(have, 0),
-                Since::Update(update) => {
-                    let held = &all[have as usize - 1];
-                    prop_assert_eq!(&held.apply(&update, root().node_id()).unwrap(), newest);
+            let (bytes, to) = next_frame(&c, StateVersion(have)).unwrap().unwrap();
+            match SubFrame::decode(&bytes).unwrap().unwrap().0 {
+                SubFrame::Policy { policy, .. } => {
+                    prop_assert!(have < n);
+                    prop_assert_eq!(&policy, newest);
+                    prop_assert_eq!(to, StateVersion(n));
                 }
+                SubFrame::Fresh { fresh } => {
+                    prop_assert!(have >= n);
+                    prop_assert_eq!(fresh.version, StateVersion(n));
+                }
+                SubFrame::Denied { .. } => prop_assert!(false, "denied"),
             }
         }
     }

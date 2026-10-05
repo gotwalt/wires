@@ -1,5 +1,5 @@
 //! Moving the signed policy by key, through the directories
-//! (`wires/directory/2`; the frames are [`library::directory`]'s).
+//! (`wires/directory/3`; the frames are [`library::directory`]'s).
 //!
 //! - [`publish_all`]: after every admin edit (and `wires policy push`), the
 //!   admin publishes the whole new policy to every directory the new head
@@ -7,12 +7,12 @@
 //!   edit drops learns it). It dials no host. A directory it can't reach is
 //!   tried again within [`PUBLISH_BUDGET`] when it has taken a publish from
 //!   this admin before ([`Retry`]: a directory just restarted is not
-//!   findable by its key for a few seconds), then reported, not queued; the
-//!   command fails when it reached none ([`PublishReport::reached_none`]).
+//!   findable by its key for a few seconds), then reported, not queued.
+//!   Directories don't replicate (card 45), so the command fails when one
+//!   of those still missed it ([`crate::admin::propagate`]).
 //! - [`fetch`]: one `policy {have}` to each directory the held head lists
-//!   in turn, stopping at the first adopted policy (whole, or the held one
-//!   with a `policy_update` applied) or the first "you are current" vouched
-//!   for by a `Fresh` from a listed directory. A host uses it once, at a
+//!   in turn, stopping at the first adopted policy or the first "you are
+//!   current" vouched for by a `Fresh` from a listed directory. A host uses it once, at a
 //!   start whose preflight fails ([`fetch_now`]: its first policy, or a
 //!   service assigned while it was down), asking the directories its network
 //!   string names while it holds no policy. Only nodes the policy names as
@@ -20,8 +20,8 @@
 //!   (card 37): a caller, the gateway included, holds its view
 //!   ([`crate::caller::view`]).
 //!
-//! A running host follows its directories by subscription instead
-//! ([`crate::host::follow`], card 36c).
+//! A running host follows a directory by subscription instead
+//! ([`crate::host::follow`]).
 //!
 //! Nothing is ever adopted except through [`store::adopt_if_newer`]
 //! (verified under the root, fresh, strictly newer), so a lying directory
@@ -140,13 +140,13 @@ impl PublishReport {
             if !refused.is_empty() {
                 out.push_str(&format!("; refused by: {}", refused.join(", ")));
             }
-            // A directory that took it hands it on: every directory the
-            // head lists follows the others (a replica subscription).
+            // Directories don't hand an edit on to each other (card 45):
+            // only a publish brings it.
             if !self.delivered.is_empty() {
                 out.push_str(&format!(
                     "; until it has version {}, hosts that follow it decide under the policy \
-                     before it. It takes this one from a directory that did as soon as it \
-                     reaches one; `wires policy push` re-publishes it",
+                     before it, and nothing but a publish brings it: `wires policy push` \
+                     re-publishes it once it is back",
                     version.0
                 ));
             } else {
@@ -175,6 +175,17 @@ impl PublishReport {
     /// Whether it missed a directory the published head lists.
     fn missed_listed(&self) -> bool {
         self.missed.iter().any(|d| !self.dropped.contains(d))
+    }
+
+    /// The directories the published head lists that missed it and are in
+    /// `reached` (they have taken a publish from this admin before, so they
+    /// run, and serve the policy before this one).
+    pub(crate) fn missed_running(&self, reached: &BTreeSet<NodeId>) -> Vec<NodeId> {
+        self.missed
+            .iter()
+            .filter(|d| !self.dropped.contains(d) && reached.contains(d))
+            .copied()
+            .collect()
     }
 }
 
@@ -405,8 +416,7 @@ fn stored(ks: &Keystore) -> Result<Held> {
 /// stopping at the first answer that settles it:
 ///
 /// - a `policy` whose `Fresh` vouches for its head, and which verifies, is
-///   fresh and is newer, is adopted and returned; so is the held policy with
-///   a `policy_update` applied ([`SignedPolicy::apply`]);
+///   fresh and is newer, is adopted and returned;
 /// - `current`, with a `Fresh` for the held head from a directory that head
 ///   lists, current at `now`: this node is up to date (`Ok(None)`).
 ///
@@ -424,7 +434,7 @@ pub(crate) async fn fetch(
         let held = store::read(ks, root)?;
         let have = held.as_ref().map_or(StateVersion(0), Held::version);
         let request = DirectoryRequest::Policy { have };
-        match ask(endpoint, *dir, None, &request).await {
+        match ask(endpoint, *dir, &request).await {
             Ok(DirectoryAnswer::Policy { policy, fresh }) => {
                 let vouched = policy
                     .head
@@ -442,35 +452,6 @@ pub(crate) async fn fetch(
                     Ok(false) => {}
                     Err(e) => {
                         tracing::warn!(directory = %dir.hex(), "refused a fetched policy: {e:#}")
-                    }
-                }
-            }
-            // The delta from the version held (card 36c): applied to the
-            // held copy, which must then verify as a whole.
-            Ok(DirectoryAnswer::PolicyUpdate { update, fresh }) => {
-                let Some(held) = held else { continue };
-                let applied = held
-                    .signed
-                    .apply(&update, root)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|next| {
-                        fresh.verify(&next.head)?;
-                        Ok(next)
-                    });
-                let next = match applied {
-                    Ok(next) => next,
-                    Err(e) => {
-                        tracing::warn!(directory = %dir.hex(), "refused a policy update: {e:#}");
-                        continue;
-                    }
-                };
-                match store::adopt_if_newer(ks, &next, root, now_unix()) {
-                    Ok(true) => {
-                        return Ok(Some(next));
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::warn!(directory = %dir.hex(), "refused a policy update: {e:#}")
                     }
                 }
             }
@@ -561,13 +542,18 @@ mod tests {
             line.contains(&format!("not reached: {}…", b.short())),
             "{line}"
         );
-        // What a miss means, when another directory took it.
+        // What a miss means, when another directory took it: nothing hands
+        // it on.
         assert!(
             line.contains(
                 "until it has version 2, hosts that follow it decide under the policy before it"
             ),
             "{line}"
         );
+        assert!(line.contains("nothing but a publish brings it"), "{line}");
+        assert!(!line.contains("takes this one from a directory"), "{line}");
+        assert_eq!(missed.missed_running(&BTreeSet::new()), vec![]);
+        assert_eq!(missed.missed_running(&[a, b].into()), vec![b]);
         assert!(line.contains("wires policy push"), "{line}");
         assert!(!missed.reached_none());
         // A refusal is named as one.
@@ -613,6 +599,7 @@ mod tests {
             ..PublishReport::default()
         };
         assert!(!only_dropped.reached_none());
+        assert_eq!(only_dropped.missed_running(&[b].into()), vec![], "dropped");
         let line = all_missed.line(StateVersion(2));
         assert!(!line.contains("hosts that follow it"), "{line}");
         assert!(

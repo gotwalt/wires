@@ -121,8 +121,7 @@ pub enum Error {
 
     /// A signed policy's items don't hash to its head's
     /// [`ItemsHash`](crate::ItemsHash): an item was tampered with, dropped or
-    /// added, or the items belong to another head. A holder applying a
-    /// [`PolicyUpdate`](crate::PolicyUpdate) then asks for the whole policy.
+    /// added, or the items belong to another head.
     #[error("the items are not the ones the policy head commits to")]
     ItemsMismatch,
 

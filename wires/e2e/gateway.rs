@@ -99,9 +99,9 @@ impl Backend for Scripted {
             crate::clock::now_unix(),
         )))
     }
-    fn caller(&self, token: IdToken, _view: Arc<HeldView>) -> Recording {
+    fn caller(&self, session: &Session, _view: Arc<HeldView>) -> Recording {
         Recording {
-            token,
+            token: session.id_token.clone(),
             seen: Arc::clone(&self.seen),
         }
     }
