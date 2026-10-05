@@ -343,8 +343,16 @@ impl Directory {
     }
 
     /// A `Fresh` for `held`'s head from `now`, or `None` (traced) when the
-    /// head doesn't list this node.
+    /// head doesn't list this node or has expired (an expired policy is
+    /// served by no directory).
     fn sign_fresh(&self, held: &Held, now: i64) -> Option<Fresh> {
+        if let Err(e) = held.check_fresh(now) {
+            tracing::warn!(
+                version = held.version().0,
+                "this directory vouches for nothing: the policy it holds {e}; publish a newer one"
+            );
+            return None;
+        }
         let secs = i64::from(held.policy.settings.fresh_secs);
         match Fresh::sign(&self.me, &held.signed.head, now, now.saturating_add(secs)) {
             Ok(f) => Some(f),
@@ -391,7 +399,8 @@ impl Directory {
     /// [`library::check_admitted`] passes (the reason it doesn't is traced).
     /// Holding no policy, it admits nobody (anyone may still publish).
     pub(crate) async fn admit(&self, caller: NodeId, id_token: Option<&IdToken>, now: i64) -> Peer {
-        let held = self.snapshot();
+        // An expired policy admits nobody.
+        let held = self.snapshot().filter(|c| c.held.check_fresh(now).is_ok());
         let named = self.holds_whole(caller);
         let principal = match (held, id_token) {
             (Some(c), Some(token)) => self
@@ -498,14 +507,19 @@ impl Directory {
     /// Every view is cut for `peer`'s node and admitted principal (a named
     /// node with none gets the empty one). Traced, not logged (see the
     /// module docs).
-    pub(crate) fn answer(&self, peer: &Peer, request: DirectoryRequest) -> DirectoryAnswer {
+    pub(crate) fn answer(
+        &self,
+        peer: &Peer,
+        request: DirectoryRequest,
+        now: i64,
+    ) -> DirectoryAnswer {
         let denied = |reason: String| DirectoryAnswer::Denied {
             reason: crate::host::transport::truncate_reason(reason),
         };
         if !peer.admitted() {
             return denied(NOT_ADMITTED.into());
         }
-        let (c, fresh) = match self.current_with_fresh() {
+        let (c, fresh) = match self.current_with_fresh(now) {
             Ok(held) => held,
             Err(reason) => return denied(reason),
         };
@@ -677,9 +691,16 @@ impl Directory {
         }
     }
 
-    /// The held policy and its `Fresh`, or why there is none to serve.
-    fn current_with_fresh(&self) -> Result<(Arc<Current>, Fresh), String> {
+    /// The held policy and its `Fresh`, or why there is none to serve (an
+    /// expired policy is served to nobody).
+    fn current_with_fresh(&self, now: i64) -> Result<(Arc<Current>, Fresh), String> {
         let c = self.snapshot().ok_or_else(|| EMPTY.to_string())?;
+        if c.held.check_fresh(now).is_err() {
+            return Err(format!(
+                "this directory holds only an expired policy (version {}); try again later",
+                c.held.version().0
+            ));
+        }
         let fresh = c.fresh.clone().ok_or_else(|| {
             format!(
                 "this node is not a directory of the policy it holds (version {})",

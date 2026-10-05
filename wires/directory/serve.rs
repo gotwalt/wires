@@ -166,7 +166,7 @@ async fn one_request(
                 (Ok(_), None, _) => {
                     refuse("asked for more than a publish without admission".into())
                 }
-                (Ok(request), Some(_slot), _) => dir.answer(&peer, request),
+                (Ok(request), Some(_slot), _) => dir.answer(&peer, request, now_unix()),
                 (Err(e), ..) => {
                     tracing::debug!(peer = %caller.hex(), "unreadable directory request: {e:#}");
                     return Ok(());
