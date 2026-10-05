@@ -1,6 +1,9 @@
-Sign in with your IdP, binding your identity to this node's key
+Sign in with your IdP (the first time with the network string: login <network>)
 
-Usage: wires login [OPTIONS]
+Usage: wires login [OPTIONS] [NETWORK]
+
+Arguments:
+  [NETWORK]  The network string your admin prints with `wires network` (the first time only: it joins this node to that network)
 
 Options:
       --node-seed <NODE_SEED>
@@ -8,11 +11,11 @@ Options:
       --node-seed-file <NODE_SEED_FILE>
           Read the node key seed (hex) from this file
       --issuer <ISSUER>
-          OIDC issuer. Falls back to `$WIRES_OIDC_ISSUER`, then the invite's, then Google
+          OIDC issuer. Falls back to `$WIRES_OIDC_ISSUER`, then the network string's, then Google
       --client-id <CLIENT_ID>
-          OAuth client id. Falls back to `$WIRES_OIDC_CLIENT_ID`, then the invite's
+          OAuth client id. Falls back to `$WIRES_OIDC_CLIENT_ID`, then the network string's
       --client-secret <CLIENT_SECRET>
-          OAuth client secret (non-confidential for Desktop-app clients). Falls back to `$WIRES_OIDC_CLIENT_SECRET`, then the invite's
+          OAuth client secret (non-confidential for Desktop-app clients). Falls back to `$WIRES_OIDC_CLIENT_SECRET`, then the network string's
       --refresh
           Renew with the stored refresh token; the browser only if that fails
       --reuse
@@ -27,5 +30,6 @@ Options:
           Also list the operator and credential flags
 
 Examples:
-  wires login
+  wires login <network>       # the first time: join and sign in
+  wires login                 # again, when your sign-in expires
   wires login --no-browser    # prints the URL to open elsewhere

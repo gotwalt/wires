@@ -1,11 +1,12 @@
-//! Frame I/O for the directory's two ALPNs, and the one-request client
-//! ([`ask`]) every other role uses.
+//! Frame I/O for the directory's two ALPNs, the one-request client
+//! ([`ask`]) every other role uses, and the admin's [`publish`].
 //!
 //! The frames are [`library::directory`]'s. Nothing is sized from a peer's
-//! length prefix: a buffer grows only as bytes arrive, a prefix over the
-//! limit is refused before a byte of body is read, and a request over
-//! [`MAX_SMALL_DIRECTORY_FRAME`] must open like a publish
-//! ([`DirectoryRequest::length`]) before the rest is read.
+//! length prefix: a buffer grows only as bytes arrive, and a prefix over the
+//! limit is refused before a byte of body is read. Every request is at most
+//! [`MAX_SMALL_DIRECTORY_FRAME`] ([`read_request`]); only a publish's
+//! `items` may be larger ([`read_items`]), and a directory reads them only
+//! after the publish's head checked out.
 
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::Endpoint;
 use library::{
     DIRECTORY_ALPN, DirectoryAnswer, DirectoryRequest, IdToken, MAX_DIRECTORY_FRAME,
-    MAX_SMALL_DIRECTORY_FRAME, Membership, NodeId, PUBLISH_BODY_PREFIX, SubFrame, SubRequest,
+    MAX_SMALL_DIRECTORY_FRAME, NodeId, SignedPolicy, SubFrame, SubRequest,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -81,43 +82,38 @@ where
     }
 }
 
-/// Read one [`DirectoryRequest`] within [`FRAME_TIMEOUT`]. A body over
-/// [`MAX_SMALL_DIRECTORY_FRAME`] must open with [`PUBLISH_BODY_PREFIX`],
-/// checked before the rest is read.
+/// Read one [`DirectoryRequest`] within [`FRAME_TIMEOUT`], at most
+/// [`MAX_SMALL_DIRECTORY_FRAME`] (refused from the prefix alone).
 pub(crate) async fn read_request<R: AsyncRead + Unpin>(r: &mut R) -> Result<DirectoryRequest> {
-    tokio::time::timeout(FRAME_TIMEOUT, async {
-        let prefix = read_prefix(r)
-            .await?
-            .ok_or_else(|| anyhow!("the stream ended before a request"))?;
-        let mut buf = Vec::with_capacity(4 + MAX_SMALL_DIRECTORY_FRAME);
-        buf.extend_from_slice(&prefix);
-        let len = match DirectoryRequest::length(&buf)? {
-            Some(len) => len,
-            None => {
-                let mut head = [0u8; PUBLISH_BODY_PREFIX.len()];
-                r.read_exact(&mut head)
-                    .await
-                    .context("reading a directory request")?;
-                buf.extend_from_slice(&head);
-                DirectoryRequest::length(&buf)?
-                    .ok_or_else(|| anyhow!("a large request that isn't a publish"))?
-            }
-        };
-        read_rest(r, &mut buf, len).await?;
-        match DirectoryRequest::decode(&buf)? {
-            Some((req, _)) => Ok(req),
-            None => bail!("truncated directory request"),
-        }
-    })
+    tokio::time::timeout(
+        FRAME_TIMEOUT,
+        read_capped(r, MAX_SMALL_DIRECTORY_FRAME, DirectoryRequest::decode),
+    )
     .await
-    .map_err(|_| anyhow!("no directory request within {FRAME_TIMEOUT:?}"))?
+    .map_err(|_| anyhow!("no directory request within {FRAME_TIMEOUT:?}"))??
+    .ok_or_else(|| anyhow!("the stream ended before a request"))
 }
 
-/// Read the frame that opens a `wires/directory/1` stream, before its
+/// Read the `items` frame of a publish whose head checked out, within
+/// [`FRAME_TIMEOUT`]: at most [`MAX_DIRECTORY_FRAME`], the one request that
+/// may be that large.
+pub(crate) async fn read_items<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<library::Item>> {
+    let frame = tokio::time::timeout(
+        FRAME_TIMEOUT,
+        read_capped(r, MAX_DIRECTORY_FRAME, DirectoryRequest::decode),
+    )
+    .await
+    .map_err(|_| anyhow!("no items within {FRAME_TIMEOUT:?}"))??
+    .ok_or_else(|| anyhow!("the stream ended before the items"))?;
+    match frame {
+        DirectoryRequest::Items { items } => Ok(items),
+        _ => bail!("a publish's head must be followed by its items"),
+    }
+}
+
+/// Read the frame that opens a `wires/directory/2` stream, before its
 /// sender is admitted, within `deadline`: at most
-/// [`MAX_SMALL_DIRECTORY_FRAME`], whatever it opens with, so a stranger
-/// can't make the directory read a publish-sized body. The caller checks it
-/// is a `hello`.
+/// [`MAX_SMALL_DIRECTORY_FRAME`]. The caller checks it is a `hello`.
 pub(crate) async fn read_hello<R: AsyncRead + Unpin>(
     r: &mut R,
     deadline: Duration,
@@ -160,14 +156,44 @@ pub(crate) async fn read_sub_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Op
     read_capped(r, MAX_DIRECTORY_FRAME, SubFrame::decode).await
 }
 
-/// Dial directory `dir` by key, open with `hello` (our badge, and ID token
-/// if any), send `request`, and return its one answer.
+/// Dial directory `dir` by key, open with `hello` (our ID token, when we
+/// act for a person), send `request`, and return its one answer.
 pub(crate) async fn ask(
     endpoint: &Endpoint,
     dir: NodeId,
-    badge: &Membership,
     id_token: Option<IdToken>,
     request: &DirectoryRequest,
+) -> Result<DirectoryAnswer> {
+    exchange(endpoint, dir, id_token, &[request.encode()?]).await
+}
+
+/// Publish `policy` to directory `dir`: `hello` (no token: the root's
+/// signature is the whole check), `publish {head}`, then `items {items}`,
+/// sent together; the directory reads the items only if the head checked
+/// out, and answers once.
+pub(crate) async fn publish(
+    endpoint: &Endpoint,
+    dir: NodeId,
+    policy: &SignedPolicy,
+) -> Result<DirectoryAnswer> {
+    let head = DirectoryRequest::Publish {
+        head: policy.head.clone(),
+    }
+    .encode()?;
+    let items = DirectoryRequest::Items {
+        items: policy.items.clone(),
+    }
+    .encode()?;
+    exchange(endpoint, dir, None, &[head, items]).await
+}
+
+/// Dial `dir`, write `hello` then the already-encoded `frames`, and read
+/// the one answer.
+async fn exchange(
+    endpoint: &Endpoint,
+    dir: NodeId,
+    id_token: Option<IdToken>,
+    frames: &[Vec<u8>],
 ) -> Result<DirectoryAnswer> {
     let addr = transport::endpoint_addr(&dir, &[], None)?;
     let conn = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, DIRECTORY_ALPN))
@@ -175,14 +201,16 @@ pub(crate) async fn ask(
         .map_err(|_| anyhow!("no answer within {DIAL_TIMEOUT:?}"))?
         .map_err(|e| anyhow!("dialing directory {}…: {e}", dir.short()))?;
     let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
-    let hello = DirectoryRequest::Hello {
-        badge: badge.clone(),
-        id_token,
-    };
-    write(&mut send, &hello.encode()?).await?;
-    write(&mut send, &request.encode()?).await?;
-    send.finish().ok();
-    let answer = read_answer(&mut recv).await;
+    let hello = DirectoryRequest::Hello { id_token };
+    let answer = async {
+        write(&mut send, &hello.encode()?).await?;
+        for frame in frames {
+            write(&mut send, frame).await?;
+        }
+        send.finish().ok();
+        read_answer(&mut recv).await
+    }
+    .await;
     conn.close(0u32.into(), b"done");
     answer
 }
@@ -192,21 +220,25 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn a_large_request_must_open_as_a_publish() {
-        // A 1 MiB body that opens like a `head`: refused before it is read.
+    async fn only_items_may_be_large() {
+        // A 1 MiB request: refused from its prefix alone, whatever it is.
         let mut bytes = ((1usize << 20) as u32).to_be_bytes().to_vec();
-        bytes.extend_from_slice(br#"{"type":"head"}"#);
+        bytes.extend_from_slice(br#"{"type":"items","items":[]}"#);
         let e = read_request(&mut bytes.as_slice()).await.unwrap_err();
-        assert!(format!("{e:#}").contains("bad frame"), "{e:#}");
-        // Over the hard limit: refused from the prefix alone.
+        assert!(format!("{e:#}").contains("1048576-byte"), "{e:#}");
+        // Over the hard limit, even items: refused from the prefix.
         let over = ((MAX_DIRECTORY_FRAME + 1) as u32).to_be_bytes();
-        assert!(read_request(&mut over.as_slice()).await.is_err());
-        // A small request reads back.
-        let head = DirectoryRequest::Head {}.encode().unwrap();
+        assert!(read_items(&mut over.as_slice()).await.is_err());
+        // A small request reads back; items read back as items, and
+        // anything else where items belong is refused.
+        let hello = DirectoryRequest::Hello { id_token: None }.encode().unwrap();
         assert_eq!(
-            read_request(&mut head.as_slice()).await.unwrap(),
-            DirectoryRequest::Head {}
+            read_request(&mut hello.as_slice()).await.unwrap(),
+            DirectoryRequest::Hello { id_token: None }
         );
+        let items = DirectoryRequest::Items { items: vec![] }.encode().unwrap();
+        assert!(read_items(&mut items.as_slice()).await.unwrap().is_empty());
+        assert!(read_items(&mut hello.as_slice()).await.is_err());
     }
 
     #[tokio::test]

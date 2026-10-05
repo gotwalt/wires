@@ -3,8 +3,8 @@
 //! `library` stays pure (no iroh/tokio); this module is where the
 //! key-addressed session meets the iroh QUIC endpoint. The session ALPN is
 //! [`ALPN`]. A caller opens a bi-stream and sends a
-//! [`Frame::Hello`] — its root-signed membership, the
-//! policy version it holds, and its IdP ID token — followed at once by
+//! [`Frame::Hello`] — the policy version it holds and its IdP ID token,
+//! which is what admits it — followed at once by
 //! a [`Frame::Invoke`] naming a service plus per-call arguments. The host
 //! ([`serve_session_permitted`]) decides by the signed policy it holds, re-read
 //! per connection (see [`gate`](crate::host::gate)), then execs the
@@ -22,11 +22,14 @@
 //!   connection, so a `wires remove` takes effect on the next dial rather
 //!   than the next restart.
 //! - **Strangers are cheap.** Anyone can open a connection, so until the
-//!   host knows the peer is a member it reads small frames only
+//!   host has admitted the peer it reads small frames only
 //!   ([`MAX_HELLO_FRAME`], [`MAX_INVOKE_FRAME`]), holds at most
-//!   [`MAX_PREAUTH_SESSIONS`] such sessions, verifies no token, says only
-//!   [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED), and traces the
-//!   refusal throttled ([`Throttle`]), so strangers can't flood the log.
+//!   [`MAX_PREAUTH_SESSIONS`] such sessions, spends one token check on it
+//!   (keys fetched only for a trusted issuer, an unknown `kid` refetched at
+//!   most once per window), says only
+//!   [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED) (or that its sign-in
+//!   expired, or the IdP is unreachable), and traces the refusal throttled
+//!   ([`Throttle`]), so strangers can't flood the log.
 //! - **One log line per call.** An admitted call's end, and an identified
 //!   caller's refusal, is one `info` line
 //!   ([`call_trace`](crate::host::call_trace)); nothing else is kept.
@@ -37,9 +40,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::presets::N0;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 
-use library::{
-    Chunk, Frame, Hello, HelloAck, Invocation, NodeId, NodeIdentity, ServiceName, check_inclusion,
-};
+use library::{Chunk, Frame, Hello, HelloAck, Invocation, NodeId, NodeIdentity, ServiceName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 
@@ -61,7 +62,7 @@ const PUMP_BUF: usize = 64 * 1024;
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// Largest [`Frame::Hello`] a host reads, before it knows who is asking: a
-/// badge, a policy version and an ID token fit in a few KiB.
+/// policy version and an ID token fit in a few KiB.
 pub(crate) const MAX_HELLO_FRAME: usize = 64 * 1024;
 
 /// Largest [`Frame::Invoke`] a host reads before admitting the caller. An
@@ -72,7 +73,7 @@ pub(crate) const MAX_HELLO_FRAME: usize = 64 * 1024;
 pub(crate) const MAX_INVOKE_FRAME: usize = 8 * library::MAX_ARGV_BYTES;
 
 /// How many sessions a host holds open at once *before* deciding who they are
-/// (reading `Hello`/`Invoke`, checking membership, verifying the ID token).
+/// (reading `Hello`/`Invoke`, verifying the ID token, checking the bans).
 /// One more is closed at once, without a reply. Admitted sessions don't
 /// count: the permit is returned as soon as the gate decides.
 pub(crate) const MAX_PREAUTH_SESSIONS: usize = 64;
@@ -524,7 +525,7 @@ impl iroh::protocol::ProtocolHandler for ServicesProtocol {
     }
 }
 
-/// Refuse a **member**: write its log line
+/// Refuse an **admitted** caller: write its log line
 /// ([`call_trace::refused`](crate::host::call_trace::refused)) and send the
 /// reason, cut as the frame carries it.
 async fn refuse_member<W: AsyncWrite + Unpin>(
@@ -540,7 +541,7 @@ async fn refuse_member<W: AsyncWrite + Unpin>(
     Refused(reason).into()
 }
 
-/// Refuse a peer not known to be a member: send `reason` and trace `detail`
+/// Refuse a peer not admitted: send `reason` and trace `detail`
 /// (throttled) — anyone can connect, so a stranger must not be able to
 /// flood the host's log.
 async fn refuse_stranger<W: AsyncWrite + Unpin>(
@@ -576,22 +577,23 @@ where
 /// (at most [`MAX_INVOKE_FRAME`]), then decide by **this host's** signed
 /// policy (re-read now, so a removal applies on the next dial):
 ///
-/// 1. the caller's badge (membership credential), and that the policy
-///    doesn't ban it
-///    ([`ServicesHost::check_member`](crate::host::gate::ServicesHost::check_member)).
-///    Anyone else hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED),
-///    costs no token verification, and is traced, throttled;
-/// 2. its ID token (verified under `identity.issuers`, bound to `caller`);
-/// 3. [`gate::admit`](crate::host::gate::admit): fresh → registered and
+/// 1. admission: its ID token (verified under the policy's issuers as
+///    `identity.issuers` narrows them, unexpired, bound to `caller`), and
+///    that the policy bans neither the node nor the person
+///    ([`ServicesHost::admit_caller`](crate::host::gate::ServicesHost::admit_caller)).
+///    Anyone else hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED)
+///    (or that its sign-in expired, or the IdP is unreachable), writes no
+///    log line, and is traced, throttled;
+/// 2. [`gate::admit`](crate::host::gate::admit): fresh → registered and
 ///    assigned here → registry role → `also_require`;
-/// 4. whether `host.json` implements the service.
+/// 3. whether `host.json` implements the service.
 ///
 /// An admitted caller's refusal is a [`Frame::Denied`] plus its log line
 /// ([`call_trace`](crate::host::call_trace)).
 /// `preauth` is returned once this is decided.
 ///
 /// Admitted: a [`Frame::HelloAck`]
-/// carrying this host's badge and policy version, plus the policy head and
+/// carrying this host's policy version, plus the policy head and
 /// the called service's signed entry when the caller's view is older (so it
 /// checks this host is still assigned before stdin, then refreshes), then the service's
 /// command with the caller's argv appended (never a shell), in its `cwd`
@@ -653,29 +655,20 @@ where
             return Err(Refused(reason.to_string()).into());
         }
     };
-    // The badge and the bans first: a stranger costs no token verification
-    // (no JWKS fetch, no identity-index entry) and no log line of its own.
-    if let Err(detail) = host.check_member(&state, &hello.membership, caller, now) {
-        let reason = crate::host::gate::NOT_ADMITTED;
-        return Err(refuse_stranger(&mut send, caller, reason, &detail).await);
-    }
+    // Admission first: the token and the bans. A stranger costs one token
+    // check and no log line of its own.
+    let verified = match host
+        .admit_caller(&state, caller, &hello.id_token, now)
+        .await
+    {
+        Ok(verified) => verified,
+        Err((reason, detail)) => {
+            return Err(refuse_stranger(&mut send, caller, reason, &detail).await);
+        }
+    };
+    let principal = Some(verified.principal.clone());
     // Admitted from here on: every refusal is the caller's log line.
-    let (principal, missing) = host.principal(caller, hello.id_token.as_ref(), now).await;
-    // The token with what it verified as: what the gate admits, and what
-    // the service is handed.
-    let verified = hello
-        .id_token
-        .clone()
-        .zip(principal.clone())
-        .map(|(token, principal)| crate::host::identity::Verified { token, principal });
-    let admitted = match host.decide(
-        &state,
-        caller,
-        verified.as_ref(),
-        missing.as_deref(),
-        &service,
-        now,
-    ) {
+    let admitted = match host.decide(&state, caller, &verified, &service, now) {
         Ok(admitted) => admitted,
         Err(reason) => {
             let who = principal.as_ref();
@@ -719,7 +712,6 @@ where
     // service's entry, to check the host is still assigned before stdin.
     let news = hello.state_version < version;
     let ack = Frame::HelloAck(HelloAck {
-        membership: host.membership.clone(),
         state_version: version,
         head: news.then(|| state.signed.head.clone()),
         entry: news
@@ -873,8 +865,8 @@ impl Denied {
         Self { reason }
     }
 
-    /// The host's stated reason, verbatim (e.g. `not a member of this
-    /// network`).
+    /// The host's stated reason, verbatim (e.g. `not admitted to this
+    /// network; sign in with \`wires login\``).
     pub fn reason(&self) -> &str {
         &self.reason
     }
@@ -893,10 +885,11 @@ pub(crate) struct ServiceDialed {
 /// preferred order) until one connects within `dial_timeout`, then open with
 /// `hello`, send `invocation` and bridge stdio on that one.
 ///
-/// `on_ack` runs once the host's `HelloAck` has verified and **before** any
-/// stdin is forwarded, with the host's id and the ack (its head version,
-/// and the head and service entry when newer than the caller's view): the
-/// caller checks the host is still assigned there and may abort the call.
+/// `on_ack` runs once the host's `HelloAck` has arrived and **before** any
+/// stdin is forwarded, with the host's id (the key iroh authenticated, one
+/// of `targets`) and the ack (its head version, and the head and service
+/// entry when newer than the caller's view): the caller checks the host is
+/// still assigned there and may abort the call.
 ///
 /// Fails over **only on a dial failure**: once a host has answered, its
 /// refusal ([`Denied`]) or a mid-session error is final (it decided, and
@@ -948,7 +941,6 @@ where
             recv,
             hello,
             invocation,
-            host,
             |ack| on_ack(host, ack),
             stdin,
             stdout,
@@ -983,7 +975,6 @@ pub(crate) async fn dial_opened<S, R, I, W, E>(
     recv: R,
     hello: Hello,
     invocation: Invocation,
-    target: NodeId,
     stdin: I,
     stdout: W,
     stderr: E,
@@ -1000,7 +991,6 @@ where
         recv,
         hello,
         invocation,
-        target,
         |_| Ok(()),
         stdin,
         stdout,
@@ -1009,12 +999,11 @@ where
     .await
 }
 
-/// The dialer half of a session over an established bi-stream to `target`
-/// (the iroh-authenticated host). Presents the `hello`, then reads the
-/// host's [`HelloAck`](library::HelloAck), verifies the membership in it
-/// against the dialer's own network root and `target`, then runs `on_ack`
-/// with the ack, all **before** any stdin is forwarded. On any failure,
-/// aborts with no stdin sent.
+/// The dialer half of a session over an established bi-stream to an
+/// iroh-authenticated host (one the service's root-signed entry names; the
+/// caller chose it). Presents the `hello`, then reads the host's
+/// [`HelloAck`](library::HelloAck) and runs `on_ack` with it, **before**
+/// any stdin is forwarded. On any failure, aborts with no stdin sent.
 ///
 /// The [`Frame::Invoke`] carrying `invocation` follows the opening
 /// immediately, without waiting for the ack.
@@ -1027,7 +1016,6 @@ pub(crate) async fn dial_opened_with<S, R, I, W, E>(
     mut recv: R,
     hello: Hello,
     invocation: Invocation,
-    target: NodeId,
     on_ack: impl FnOnce(&HelloAck) -> Result<()>,
     stdin: I,
     mut stdout: W,
@@ -1040,8 +1028,6 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    // The dialer's own network root is the authority for verifying the host.
-    let root = hello.membership.fabric;
     write_frame(&mut send, &Frame::Hello(hello)).await?;
     write_frame(&mut send, &Frame::Invoke(invocation)).await?;
 
@@ -1054,11 +1040,8 @@ where
         Some(_) => bail!("the host's first frame was not a hello ack"),
         None => bail!("the host closed before sending a hello ack"),
     };
-    // Before any stdin: the host's membership must be one our root signed
-    // for this very key, and current. Whether the host is still assigned the
-    // service is `on_ack`'s to check, against the ack's head and entry.
-    check_inclusion(&ack.membership, root, target, crate::clock::now_unix())
-        .map_err(|e| anyhow!("the host's membership was rejected (no stdin sent): {e}"))?;
+    // Before any stdin: whether the host is still assigned the service is
+    // `on_ack`'s to check, against the ack's head and entry.
     on_ack(&ack)?;
 
     // Local stdin -> Stdin frames, then shut down the send direction (EOF).
@@ -1112,7 +1095,7 @@ mod tests {
     use crate::admin::keystore::Keystore;
     use crate::host::config::HostConfig;
     use crate::host::gate::ServicesHost;
-    use library::{Argv, Membership, Policy, Service, StateVersion};
+    use library::{Argv, Policy, Service, StateVersion};
 
     #[test]
     fn a_service_child_gets_a_minimal_environment() {
@@ -1182,6 +1165,11 @@ mod tests {
 
     /// [`host_running`], before it is shared.
     fn host_unshared(command: &[&str]) -> ServicesHost {
+        host_with(command, |_| {})
+    }
+
+    /// [`host_unshared`], its policy changed by `edit` first.
+    fn host_with(command: &[&str], edit: impl FnOnce(&mut Policy)) -> ServicesHost {
         let (root, host) = (root(), host_id());
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
@@ -1189,7 +1177,7 @@ mod tests {
         s.version = StateVersion(1);
         s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
-        s.ban(stranger(7).0, i64::MAX);
+        s.ban(stranger(7).0);
         let (staff, matchers) = crate::testutil::staff_role();
         s.roles.insert(staff.clone(), matchers);
         s.services.insert(
@@ -1200,6 +1188,7 @@ mod tests {
                 hosts: vec![host.node_id()],
             },
         );
+        edit(&mut s);
         let signed = crate::testutil::signed_policy(&root, s);
         crate::policy::store::adopt_if_newer(
             &ks,
@@ -1214,22 +1203,16 @@ mod tests {
             serde_json::to_string(command).unwrap()
         ))
         .unwrap();
-        crate::host::serve::services_host(
-            host.node_id(),
-            Membership::mint(&root, host.node_id(), 0, i64::MAX).unwrap(),
-            Arc::new(ks),
-            config,
-        )
-        .unwrap()
+        crate::host::serve::services_host(host.node_id(), root.node_id(), Arc::new(ks), config)
+            .unwrap()
     }
 
-    /// The caller's `Hello` (badge under the root, policy version 1, and
-    /// an ID token from the shared test IdP: service `t` needs `staff`).
+    /// The caller's `Hello` (policy version 1, and an ID token from the
+    /// shared test IdP bound to the caller's key: service `t` needs `staff`).
     fn hello() -> Hello {
         Hello {
-            membership: Membership::mint(&root(), caller_id().node_id(), 0, i64::MAX).unwrap(),
             state_version: StateVersion(1),
-            id_token: Some(crate::testutil::test_id_token(&caller_id().node_id())),
+            id_token: crate::testutil::test_id_token(&caller_id().node_id()),
         }
     }
 
@@ -1270,7 +1253,6 @@ mod tests {
             s2c_r,
             hello(),
             invoke(args),
-            host_id().node_id(),
             std::io::Cursor::new(input.to_vec()),
             &mut out,
             &mut err,
@@ -1386,7 +1368,6 @@ mod tests {
                 s2c_r,
                 hello(),
                 invoke(&[]),
-                host_id().node_id(),
                 stdin,
                 &mut out,
                 &mut err,
@@ -1590,14 +1571,13 @@ mod tests {
         refusal_by(&host_running(&["cat"]), encoded(frames), caller).await
     }
 
-    /// A key the policy bans, with a badge the root really minted for it (so
-    /// only the ban keeps it out).
+    /// A key, with a genuine ID token bound to it (seed 7's node is the one
+    /// the policy bans, so only the ban keeps it out).
     fn stranger(seed: u8) -> (NodeId, Hello) {
         let id = NodeIdentity::from_seed([seed; 32]).node_id();
         let hello = Hello {
-            membership: Membership::mint(&root(), id, 0, i64::MAX).unwrap(),
             state_version: StateVersion(1),
-            id_token: None,
+            id_token: crate::testutil::test_id_token(&id),
         };
         (id, hello)
     }
@@ -1611,65 +1591,108 @@ mod tests {
         assert_eq!(r, DENY_INVOKE_REQUIRED);
     }
 
-    /// Whatever keeps a peer out — someone else's badge, a badge from another
-    /// network, or a genuine one the policy bans — it hears the one fixed
-    /// sentence: no reason, no policy version.
+    /// A `Hello` without an ID token is refused at that first message:
+    /// it doesn't decode, and nothing runs.
     #[tokio::test]
-    async fn a_non_member_hears_only_the_fixed_refusal() {
-        let open = [Frame::Hello(hello()), Frame::Invoke(invoke(&[]))];
-        let theirs = refusal(&open, NodeIdentity::from_seed([9u8; 32]).node_id()).await;
-        let other_root = NodeIdentity::from_seed([8u8; 32]);
-        let (id, _) = stranger(7);
-        let foreign = Hello {
-            membership: Membership::mint(&other_root, id, 0, i64::MAX).unwrap(),
-            ..hello()
-        };
-        let foreign = refusal(&[Frame::Hello(foreign), Frame::Invoke(invoke(&[]))], id).await;
-        let (id, genuine) = stranger(7);
-        let banned = refusal(&[Frame::Hello(genuine), Frame::Invoke(invoke(&[]))], id).await;
-        for r in [theirs, foreign, banned] {
-            assert_eq!(r, crate::host::gate::NOT_ADMITTED);
-        }
+    async fn a_hello_without_a_token_is_refused_at_the_first_message() {
+        let body = br#"{"state_version":1}"#;
+        let mut bytes = ((body.len() + 1) as u32).to_be_bytes().to_vec();
+        bytes.push(10); // the `Hello` tag
+        bytes.extend_from_slice(body);
+        bytes.extend(Frame::Invoke(invoke(&[])).encode().unwrap());
+        let r = refusal_by(&host_running(&["cat"]), bytes, caller_id().node_id()).await;
+        assert_eq!(r, "unreadable hello");
     }
 
-    /// A banned node's ID token is never looked at: no verification, so no
-    /// JWKS fetch and no identity-index entry. (An admitted node's is.)
+    /// Whatever keeps a caller out — a token bound to another key, a forged
+    /// one, one from an issuer the policy doesn't trust, a banned node or a
+    /// banned person — it hears the one fixed sentence: no reason, no policy
+    /// version. An expired token says so (it is who it says).
     #[tokio::test]
-    async fn a_non_member_never_has_its_token_verified() {
+    async fn a_caller_without_a_valid_sign_in_hears_only_the_fixed_refusal() {
+        let open = |hello: Hello| encoded(&[Frame::Hello(hello), Frame::Invoke(invoke(&[]))]);
+        let host = host_running(&["cat"]);
+        // The caller's own token, presented by another key.
+        let theirs = refusal_by(&host, open(hello()), stranger(9).0).await;
+        // A forged token.
+        let forged = Hello {
+            id_token: library::IdToken::new("eyJhbGciOiJSUzI1NiJ9.e30.c2ln"),
+            ..hello()
+        };
+        let forged = refusal_by(&host, open(forged), caller_id().node_id()).await;
+        // A banned node, with a genuine token bound to it.
+        let (id, genuine) = stranger(7);
+        let banned = refusal_by(&host, open(genuine), id).await;
+        // A banned person, from a node nobody banned.
+        let removed = host_with(&["cat"], |p| {
+            p.ban_person(library::Person::new(
+                crate::testutil::test_idp().issuer.clone(),
+                "caller@example.com",
+            ));
+        });
+        let person = refusal_by(&removed, open(hello()), caller_id().node_id()).await;
+        // An issuer the policy no longer trusts: no role names it, so the
+        // only issuer goes and nothing verifies.
+        let untrusting = host_with(&["cat"], |p| {
+            p.roles.clear();
+            p.services.values_mut().for_each(|s| s.allow.clear());
+            p.issuers.clear();
+            p.issuers.insert(
+                library::Issuer::new("https://other-idp.example"),
+                library::IssuerConfig {
+                    client_id: library::Audience::new("x"),
+                    audiences: vec![library::Audience::new("x")],
+                },
+            );
+        });
+        let untrusted = refusal_by(&untrusting, open(hello()), caller_id().node_id()).await;
+        for r in [theirs, forged, banned, person, untrusted] {
+            assert_eq!(r, crate::host::gate::NOT_ADMITTED);
+        }
+        let expired = Hello {
+            id_token: crate::testutil::test_idp().mint(
+                &library::OidcNonce::for_node(&caller_id().node_id()),
+                crate::clock::now_unix() - 3600,
+            ),
+            ..hello()
+        };
+        let expired = refusal_by(&host, open(expired), caller_id().node_id()).await;
+        assert_eq!(expired, crate::host::gate::SIGN_IN_EXPIRED);
+    }
+
+    /// A token that fails leaves nothing behind: no identity-index entry
+    /// (any key can present one). A caller's that verifies is indexed.
+    #[tokio::test]
+    async fn a_failed_token_leaves_no_identity() {
         let host = host_running(&["true"]);
         let token =
             library::IdToken::new("eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIn0.");
-        let (id, mut hello_s) = stranger(7);
-        hello_s.id_token = Some(token.clone());
+        let forged = Hello {
+            id_token: token,
+            ..hello()
+        };
+        let (id, _) = stranger(9);
         let r = refusal_by(
             &host,
-            encoded(&[Frame::Hello(hello_s), Frame::Invoke(invoke(&[]))]),
+            encoded(&[Frame::Hello(forged), Frame::Invoke(invoke(&[]))]),
             id,
         )
         .await;
         assert_eq!(r, crate::host::gate::NOT_ADMITTED);
-        assert!(
-            host.identities.nodes().is_empty(),
-            "a stranger's token was verified"
-        );
-        // The member's token is verified (and fails: its issuer isn't trusted).
-        let member = Hello {
-            id_token: Some(token),
-            ..hello()
-        };
+        assert!(host.identities.nodes().is_empty(), "a failure was indexed");
         let (send, _answer) = tokio::io::duplex(64 * 1024);
-        let bytes = encoded(&[Frame::Hello(member), Frame::Invoke(invoke(&[]))]);
+        let bytes = encoded(&[Frame::Hello(hello()), Frame::Invoke(invoke(&[]))]);
         let caller = caller_id().node_id();
         let _ =
             serve_services_session(send, std::io::Cursor::new(bytes), caller, &host, never()).await;
         assert_eq!(host.identities.nodes(), [caller]);
     }
 
-    /// The card's flood: a thousand connections from keys that aren't
-    /// admitted — junk, silence, out-of-turn frames, someone else's badge,
-    /// a genuine but banned one — leave no `call refused` line, and at most
-    /// one throttled `info` report. An identified member's refusal is its
-    /// own line.
+    /// The card's flood:    /// The card's flood: a thousand connections from keys that aren't
+    /// admitted — junk, silence, out-of-turn frames, someone else's token,
+    /// a genuine token on a banned node — leave no `call refused` line, and
+    /// at most one throttled `info` report. An admitted caller's refusal is
+    /// its own line.
     #[tokio::test]
     async fn strangers_leave_no_call_lines_and_members_do() {
         let (lines, _guard) = crate::host::call_trace::capture::lines();
@@ -1756,7 +1779,6 @@ mod tests {
             s2c_r,
             hello(),
             invoke(&["secret-arg"]),
-            host_id().node_id(),
             std::io::Cursor::new(Vec::new()),
             &mut out,
             &mut Vec::new(),

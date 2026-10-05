@@ -1,7 +1,7 @@
 //! Getting an admin edit to the directories, and `wires policy push`.
 //!
-//! Every admin edit (`remove`, `service`, `role`, `issuer`, `directory add |
-//! rm`, and the rare `invite` that edits) is signed and stored here first,
+//! Every admin edit (`remove`, `restore`, `service`, `role`, `issuer`,
+//! `directory add | rm`, `policy settings`) is signed and stored here first,
 //! then published to every directory the new head lists (and those the head
 //! before the edit listed) by key ([`fetch::publish_current`]). The admin
 //! dials no host: hosts and callers fetch from a directory. If the policy
@@ -13,8 +13,10 @@
 //!
 //! - **The first run.** Until some directory the publish aims at has ever
 //!   taken a publish from this admin ([`REACHED_FILE`]), reaching none is a
-//!   one-line note, not a failure: no directory is running yet, and the
-//!   one the admin starts gets the policy in its invite.
+//!   one-line note, not a failure: no directory is running yet. The first
+//!   directory starts empty and takes the policy from the admin's next
+//!   publish (`wires policy push`, or the next edit): the network's one
+//!   bootstrap step.
 //! - **A stale copy.** A directory holding a newer policy than the one
 //!   published (or another at its version) fails the command, whatever the
 //!   others did: this admin's `policy.json` is behind, so its edit changed
@@ -103,9 +105,9 @@ impl Propagation {
             }
             Ok((version, report)) if report.reached_none() && first_run => Propagation {
                 note: format!(
-                    "policy version {}: no directory is running yet (none has taken a publish \
-                     from this admin); start one with `wires directory serve` on its node: an \
-                     invite minted from now on carries this policy",
+                    "policy version {} is stored here; no directory has taken a publish yet. \
+                     Once one runs (`wires join <network>`, then `wires serve` or `wires \
+                     directory serve` on its node), run `wires policy push`",
                     version.0
                 ),
                 failure: None,
@@ -274,15 +276,11 @@ mod tests {
         let first = settle(&ks, Ok((StateVersion(2), missed(&[dir]))));
         assert_eq!(first.failure, None);
         assert!(
-            first.note.contains("no directory is running yet"),
+            first.note.contains("no directory has taken a publish yet"),
             "{}",
             first.note
         );
-        assert!(
-            first.note.contains("wires directory serve"),
-            "{}",
-            first.note
-        );
+        assert!(first.note.contains("wires policy push"), "{}", first.note);
         // It runs, and takes the next edit.
         let took = PublishReport {
             delivered: vec![dir],

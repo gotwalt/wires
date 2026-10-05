@@ -154,9 +154,6 @@ mod tests {
     fn admin_with_a_directory() -> Keystore {
         let ks = admin();
         let dir = library::NodeIdentity::generate().node_id();
-        let mut ledger = crate::admin::ledger::Ledger::load(&ks).unwrap();
-        ledger.record(dir, None, i64::MAX);
-        ledger.save(&ks).unwrap();
         crate::admin::service::directory_add(&ks, dir, Ttl::default()).unwrap();
         ks
     }

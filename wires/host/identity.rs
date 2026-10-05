@@ -12,7 +12,8 @@
 //! connection authenticated the presenting key, and the token's OIDC nonce
 //! binds it to that key, so a token for someone else's key never verifies.
 //! A token that fails is traced and never displaces a principal that
-//! verified.
+//! verified, and leaves no entry: any key can present a token (a token is
+//! what admits a caller), so only a signature that verified grows the index.
 //!
 //! Nothing is broadcast: a host knows the identities of the callers that
 //! have spoken to it, and no others. That is what push authorization reads
@@ -102,9 +103,9 @@ pub(crate) struct Identities {
     fetcher: KeyFetcher,
     /// Which issuers and audiences this host accepts now.
     trust: std::sync::RwLock<IdpTrust>,
-    /// Every node a token has been seen from, with the verified principal
-    /// of the latest `exp` (possibly stale by now), if any verified.
-    known: Mutex<HashMap<NodeId, Option<Principal>>>,
+    /// Every node a token whose signature verified was seen from, with the
+    /// verified principal of the latest `exp` (possibly stale by now).
+    known: Mutex<HashMap<NodeId, Principal>>,
 }
 
 impl std::fmt::Debug for Identities {
@@ -171,26 +172,29 @@ impl Identities {
     ///
     /// A verified principal (fresh or expired) replaces the held one when its
     /// `exp` is at least as late — re-logins win, and replaying an old token
-    /// cannot roll a node back to an older identity. A failure is traced,
-    /// and only notes that the node presented a token.
+    /// cannot roll a node back to an older identity. A failure is traced at
+    /// `debug` (any key can cause one; the session's throttle counts them)
+    /// and leaves no entry.
     pub(crate) fn record(&self, node: NodeId, verdict: &Verdict) {
-        let mut known = self.known.lock().expect("identity index poisoned");
-        let held = known.entry(node).or_default();
         let p = match verdict {
             Ok(p) => p,
             Err(VerifyError::Expired(p)) => &**p,
             Err(e) => {
-                tracing::warn!(node = %node.hex(), "ID token did not verify: {e}");
+                tracing::debug!(node = %node.hex(), "ID token did not verify: {e}");
                 return;
             }
         };
-        if held.as_ref().is_none_or(|h| p.not_after >= h.not_after) {
-            tracing::info!(node = %node.hex(), who = %p.name(), "identity verified");
-            *held = Some(p.clone());
+        let mut known = self.known.lock().expect("identity index poisoned");
+        let newer = known
+            .get(&node)
+            .is_none_or(|held| p.not_after >= held.not_after);
+        if newer {
+            tracing::debug!(node = %node.hex(), who = %p.name(), "identity verified");
+            known.insert(node, p.clone());
         }
     }
 
-    /// Every node a token has been seen from, verified or not.
+    /// Every node a token whose signature verified was seen from.
     pub(crate) fn nodes(&self) -> Vec<NodeId> {
         let known = self.known.lock().expect("identity index poisoned");
         known.keys().copied().collect()
@@ -199,7 +203,7 @@ impl Identities {
     /// The principal `node` last verified as, fresh or not.
     fn latest(&self, node: NodeId) -> Option<Principal> {
         let known = self.known.lock().expect("identity index poisoned");
-        known.get(&node).cloned().flatten()
+        known.get(&node).cloned()
     }
 
     /// `node`'s principal if one verified and is still fresh at `now`.
@@ -251,9 +255,9 @@ mod tests {
                 node: n.hex(),
             })),
         );
-        // Seen, but nobody verified.
+        // A token that failed leaves nothing: strangers can't grow the index.
         assert_eq!(ids.latest(n), None);
-        assert_eq!(ids.nodes(), vec![n]);
+        assert!(ids.nodes().is_empty());
         ids.record(n, &Ok(who("alice@example.com", 1_000)));
         assert_eq!(ids.current(n, 100), Some(who("alice@example.com", 1_000)));
         assert_eq!(ids.current(n, 1_000 + CLOCK_SKEW_SECS + 1), None);

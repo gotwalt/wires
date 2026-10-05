@@ -3,8 +3,9 @@
 //! A host is `wires serve host.json`: `host.json` (version 2) says how each
 //! service runs here; the admin-signed policy says who may call it. Every
 //! call is decided by the policy as it stands at that connection — the
-//! badge and bans, the registry's role for the service, then any stricter
-//! local rule — and traced by the host as one ordinary log line.
+//! caller's ID token and the bans, the registry's role for the service, then
+//! any stricter local rule — and traced by the host as one ordinary log
+//! line.
 //!
 //! - [`serve`] — `wires serve host.json` / `--check`: preflight, bind, serve.
 //! - [`config`] — `host.json` (services it implements, local trust,
@@ -24,7 +25,7 @@
 //! - [`freshness`] — the newest `Fresh` for the held head (`fresh.json`),
 //!   and the signed rule (`lenient` / `strict`) for when it lapses.
 //! - [`identity`] — the ID tokens callers presented, verified and indexed.
-//! - [`call_trace`] — the one `tracing` line a call (or an identified
+//! - [`call_trace`] — the one `tracing` line a call (or an admitted
 //!   caller's refusal) leaves in `serve`'s output.
 //! - [`push`] — `wires push`: messages to callers by key, queued, delivered
 //!   or fetched, gated by the signed policy and `push.allow` (card 23).

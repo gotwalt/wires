@@ -880,7 +880,7 @@ pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
     let token_ks = Arc::clone(&ks);
     let (mut views, follower) = crate::caller::view::follow(crate::caller::view::Follow {
         endpoint: endpoint.clone(),
-        badge: creds.membership().clone(),
+        root: creds.fabric(),
         id_token: Arc::new(move || crate::caller::hello::stored_token(&token_ks)),
         initial: held,
         fallback: crate::caller::view::joined_directories(&ks),
@@ -994,7 +994,7 @@ mod tests {
             .answer("fails", Ok(exited(2, "partial", "boom\n")))
             .answer(
                 "locked",
-                Ok(CallOutcome::Denied("not a member of this network".into())),
+                Ok(CallOutcome::Denied("removed from this network".into())),
             )
             .answer(
                 "offline",
@@ -1069,11 +1069,7 @@ mod tests {
             ]}}),
             text_result(3, "id\n1\nexit: 0", false),
             text_result(4, "partial\nstderr:\nboom\nexit: 2", true),
-            text_result(
-                5,
-                &crate::help::refusal("not a member of this network"),
-                true,
-            ),
+            text_result(5, &crate::help::refusal("removed from this network"), true),
             json!({"jsonrpc":"2.0","id":6,"error":{"code":-32602,"message":"unknown tool: nope"}}),
             text_result(
                 7,
@@ -1215,11 +1211,7 @@ mod tests {
         let out = transcript(&mut s, &[call(2, "locked", json!({}))]);
         assert_eq!(
             out[0],
-            text_result(
-                2,
-                &crate::help::refusal("not a member of this network"),
-                true
-            ),
+            text_result(2, &crate::help::refusal("removed from this network"), true),
             "a refusal is an answer, still shown"
         );
     }
@@ -1447,7 +1439,11 @@ mod tests {
             groups: vec![],
             not_after: i64::MAX,
         };
-        crate::testutil::signed_policy(&root, state).view_for(Some(&anyone), None)
+        crate::testutil::signed_policy(&root, state).view_for(
+            crate::testutil::any_node(),
+            Some(&anyone),
+            None,
+        )
     }
 
     /// Card 28 §8: a service in the view beats an alias of the same name,

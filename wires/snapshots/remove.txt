@@ -1,13 +1,15 @@
-Ban a node until its badge expires; hosts refuse its next call
+Remove a person (email) or a node (label or id); hosts refuse them
 
-Usage: wires remove [OPTIONS] <MEMBER>
+Usage: wires remove [OPTIONS] <WHO>
 
 Arguments:
-  <MEMBER>  The node to remove: its `wires invite --name` label, or its node id
+  <WHO>  A person's email, or a node's label or id (`label=<node id>` names it)
 
 Options:
-  -h, --help      Print help
-      --help-all  Also list the operator and credential flags
+      --issuer <ISSUER>  The IdP that verifies the email: its exact `iss` (default: the one the network string names)
+  -h, --help             Print help
+      --help-all         Also list the operator and credential flags
 
-Example:
-  wires remove alice
+Examples:
+  wires remove alice@example.com        # a person, from every machine
+  wires remove workbench                # a node, by label or id

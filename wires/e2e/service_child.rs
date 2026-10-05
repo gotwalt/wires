@@ -30,8 +30,7 @@ use library::{
 use tokio::sync::mpsc;
 
 use super::{
-    Outcome, adopt, bind, email_at, host_config, localhost_socks, membership, role, service,
-    signed_state,
+    Outcome, adopt, bind, email_at, host_config, localhost_socks, role, service, signed_state,
 };
 use crate::admin::keystore::Keystore;
 use crate::caller::mock_idp::MockIdp;
@@ -89,7 +88,7 @@ impl World {
     }
 
     fn hello(&self, who: &NodeIdentity) -> Hello {
-        super::hello(&self.root, who, 1, Some(&self.idp))
+        super::hello(who, 1, Some(&self.idp))
     }
 }
 
@@ -109,7 +108,7 @@ impl Host {
         adopt(&keystore, &w.root, &w.state(1));
         let host = services_host(
             w.host.node_id(),
-            membership(&w.root, &w.host),
+            w.root.node_id(),
             Arc::clone(&keystore),
             w.host_json(),
         )
@@ -230,7 +229,7 @@ async fn a_child_gets_its_callers_id_token_and_verified_claims() {
     let exp = crate::clock::now_unix() + 3600;
     let mut hello = w.hello(&w.alice);
     let token = w.idp.mint(&OidcNonce::for_node(&w.alice.node_id()), exp);
-    hello.id_token = Some(token.clone());
+    hello.id_token = token.clone();
     let env = match super::call(&w.alice, &host.addr, hello, "env", &[]).await {
         Outcome::Denied(reason) => panic!("denied: {reason}"),
         ran => env_of(&ran),

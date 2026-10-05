@@ -1,5 +1,5 @@
 //! Moving the signed policy by key, through the directories
-//! (`wires/directory/1`; the frames are [`library::directory`]'s).
+//! (`wires/directory/2`; the frames are [`library::directory`]'s).
 //!
 //! - [`publish_all`]: after every admin edit (and `wires policy push`), the
 //!   admin publishes the whole new policy to every directory the new head
@@ -11,8 +11,10 @@
 //!   in turn, stopping at the first adopted policy (whole, or the held one
 //!   with a `policy_update` applied) or the first "you are current" vouched
 //!   for by a `Fresh` from a listed directory. A host uses it once, at a
-//!   start whose preflight fails ([`fetch_now`]: a service assigned while it
-//!   was down). Only hosts and directories may fetch the whole policy
+//!   start whose preflight fails ([`fetch_now`]: its first policy, or a
+//!   service assigned while it was down), asking the directories its network
+//!   string names while it holds no policy. Only nodes the policy names as
+//!   hosts and directories may fetch the whole policy
 //!   (card 37): a caller, the gateway included, holds its view
 //!   ([`crate::caller::view`]).
 //!
@@ -30,14 +32,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use iroh::Endpoint;
 use library::{
-    DIRECTORY_ALPN, DirectoryAnswer, DirectoryRequest, Membership, NodeId, NodeIdentity,
-    SignedPolicy, StateVersion,
+    DIRECTORY_ALPN, DirectoryAnswer, DirectoryRequest, NodeId, NodeIdentity, SignedPolicy,
+    StateVersion,
 };
 
 use super::store::{self, Held};
 use crate::admin::keystore::{self, Keystore};
 use crate::clock::now_unix;
-use crate::directory::wire::ask;
+use crate::directory::wire::{ask, publish};
 use crate::host::transport;
 
 /// How long a host's start-up fetch ([`fetch_now`]) spends, all directories together.
@@ -62,8 +64,8 @@ impl PublishReport {
         let total = self.delivered.len() + self.missed.len() + self.newer.len();
         if total == 0 {
             return format!(
-                "policy version {}: no directory to publish to yet (name one with `wires \
-                 directory add <node>`; a new node gets the policy in its invite token)",
+                "policy version {} is stored here: no directory to publish to yet (name one with \
+                 `wires directory add <label>=<node id>`)",
                 version.0
             );
         }
@@ -116,44 +118,37 @@ enum Took {
     Newer(StateVersion),
 }
 
-/// Publish `policy` to each of `targets`, concurrently, presenting `badge`
-/// (the admin's own). A target counts as delivered when it answers holding
-/// `policy`'s version and, asked for its head, holds this very head (a
-/// head it can't show leaves the answer standing). One answering a newer
-/// version, or showing another head at this version, is
-/// [`newer`](PublishReport::newer): the publisher's copy was stale, and the
-/// directory kept its own.
+/// Publish `policy` to each of `targets`, concurrently ([`publish`]: no
+/// credential, the root's signature is the whole check). A target counts as
+/// delivered when it answers holding `policy`'s version and its very head
+/// (by [`HeadHash`](library::HeadHash)). One answering a newer version, or
+/// another head at this version, is [`newer`](PublishReport::newer): the
+/// publisher's copy was stale, and the directory kept its own.
 pub(crate) async fn publish_all(
     endpoint: &Endpoint,
-    badge: &Membership,
     policy: &SignedPolicy,
     targets: &[NodeId],
 ) -> Result<PublishReport> {
     let mut report = PublishReport::default();
     let mut set = tokio::task::JoinSet::new();
-    let request = Arc::new(DirectoryRequest::Publish {
-        head: policy.head.clone(),
-        items: policy.items.clone(),
-    });
+    let policy = Arc::new(policy.clone());
+    let want_head = policy.head.hash()?;
     for &target in targets {
         let endpoint = endpoint.clone();
-        let badge = badge.clone();
-        let request = Arc::clone(&request);
-        let head = policy.head.clone();
+        let policy = Arc::clone(&policy);
         set.spawn(async move {
-            let want = head.head.version;
-            let took = match ask(&endpoint, target, &badge, None, &request).await {
-                Ok(DirectoryAnswer::Published { version }) if version > want => {
+            let want = policy.version();
+            let took = match publish(&endpoint, target, &policy).await {
+                Ok(DirectoryAnswer::Published { version, .. }) if version > want => {
                     Took::Newer(version)
                 }
-                Ok(DirectoryAnswer::Published { version }) if version == want => {
-                    // The same version may be another policy (an admin
-                    // whose copy was one edit behind): ask for the head.
-                    match ask(&endpoint, target, &badge, None, &DirectoryRequest::Head {}).await {
-                        Ok(DirectoryAnswer::Head { head: theirs, .. }) if theirs != head => {
-                            Took::Newer(theirs.head.version)
-                        }
-                        _ => Took::Delivered,
+                // The same version may be another policy (an admin whose
+                // copy was one edit behind): its head says.
+                Ok(DirectoryAnswer::Published { version, head }) if version == want => {
+                    if head == want_head {
+                        Took::Delivered
+                    } else {
+                        Took::Newer(version)
                     }
                 }
                 Ok(DirectoryAnswer::Denied { reason }) => {
@@ -204,13 +199,7 @@ pub(crate) async fn publish_current_on(
 ) -> Result<PublishReport> {
     let held = stored(ks)?;
     let me = transport::to_node_id(&endpoint.id());
-    publish_all(
-        endpoint,
-        &badge(ks)?,
-        &held.signed,
-        &publish_targets(&held, earlier, me),
-    )
-    .await
+    publish_all(endpoint, &held.signed, &publish_targets(&held, earlier, me)).await
 }
 
 /// [`publish_current_on`] over a freshly bound endpoint for this keystore's
@@ -235,22 +224,18 @@ pub(crate) async fn publish_current(
 /// The directories of the policy `ks` holds now (empty when it holds none):
 /// what an admin command records before its edit, for [`publish_targets`].
 pub(crate) fn held_directories(ks: &Keystore) -> Result<BTreeSet<NodeId>> {
-    let Some(root) = store::fabric(ks)? else {
+    let Some(root) = ks.network_root()? else {
         return Ok(BTreeSet::new());
     };
     Ok(store::read(ks, root)?
         .map_or_else(BTreeSet::new, |h| h.directories().iter().copied().collect()))
 }
 
-/// This node's own badge, which every request opens with.
-fn badge(ks: &Keystore) -> Result<Membership> {
-    ks.read_membership()?
-        .ok_or_else(|| anyhow!("this keystore holds no badge (membership.json)"))
-}
-
 /// The policy `ks` holds, or an error saying there is none.
 fn stored(ks: &Keystore) -> Result<Held> {
-    let root = store::fabric(ks)?.ok_or_else(|| anyhow!("this keystore is in no network"))?;
+    let root = ks
+        .network_root()?
+        .ok_or_else(|| anyhow!("this keystore is in no network"))?;
     store::read(ks, root)?.ok_or_else(|| anyhow!("no signed policy here"))
 }
 
@@ -274,13 +259,14 @@ pub(crate) async fn fetch(
     ks: &Keystore,
     directories: &[NodeId],
 ) -> Result<Option<SignedPolicy>> {
-    let root = store::fabric(ks)?.ok_or_else(|| anyhow!("this keystore is in no network"))?;
-    let badge = badge(ks)?;
+    let root = ks
+        .network_root()?
+        .ok_or_else(|| anyhow!("this keystore is in no network"))?;
     for dir in directories {
         let held = store::read(ks, root)?;
         let have = held.as_ref().map_or(StateVersion(0), Held::version);
         let request = DirectoryRequest::Policy { have };
-        match ask(endpoint, *dir, &badge, None, &request).await {
+        match ask(endpoint, *dir, None, &request).await {
             Ok(DirectoryAnswer::Policy { policy, fresh }) => {
                 let vouched = policy
                     .head
@@ -355,18 +341,17 @@ pub(crate) async fn fetch(
 }
 
 /// The directories this node asks, never itself: those its held policy
-/// lists, in the admin's order.
+/// lists, in the admin's order, or, holding none yet, those its network
+/// string names.
 pub(crate) fn directories_of(ks: &Keystore, me: NodeId) -> Result<Vec<NodeId>> {
-    let Some(root) = store::fabric(ks)? else {
+    let Some(root) = ks.network_root()? else {
         return Ok(Vec::new());
     };
-    Ok(store::read(ks, root)?.map_or_else(Vec::new, |h| {
-        h.directories()
-            .iter()
-            .copied()
-            .filter(|d| *d != me)
-            .collect()
-    }))
+    let listed = match store::read(ks, root)? {
+        Some(h) => h.directories().to_vec(),
+        None => ks.read_network()?.map_or_else(Vec::new, |n| n.directories),
+    };
+    Ok(listed.into_iter().filter(|d| *d != me).collect())
 }
 
 /// [`fetch`] over `endpoint` from [`directories_of`], whether or not the
@@ -380,9 +365,9 @@ pub(crate) async fn catch_up(endpoint: &Endpoint, ks: &Keystore) -> Result<Optio
     fetch(endpoint, ks, &dirs).await
 }
 
-/// `wires serve`'s fetch at start (a host assigned a service while it was
-/// offline): bind as `node` briefly and [`catch_up`], within the start-up fetch
-/// budget.
+/// `wires serve`'s fetch at start (its first policy, or a service assigned
+/// while it was offline): bind as `node` briefly and [`catch_up`], within
+/// the start-up fetch budget.
 pub(crate) async fn fetch_now(
     ks: &Keystore,
     node: &NodeIdentity,

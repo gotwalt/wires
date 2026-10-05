@@ -21,11 +21,11 @@ use crate::Cli;
 use crate::caller::lock::Refused;
 use crate::help;
 use crate::host::gate::{
-    GateRefusal, HOST_MISCONFIGURED, IDP_UNREACHABLE, NOT_ADMITTED, TOKEN_UNVERIFIED,
+    GateRefusal, HOST_MISCONFIGURED, IDP_UNREACHABLE, NOT_ADMITTED, SIGN_IN_EXPIRED,
 };
 
 /// The commands a caller runs: `wires --help` lists exactly these.
-const CALLER: &[&str] = &["services", "call", "login", "join", "id", "inbox", "mcp"];
+const CALLER: &[&str] = &["services", "call", "login", "inbox", "mcp"];
 
 /// Where the snapshots live.
 fn dir() -> PathBuf {
@@ -153,12 +153,6 @@ fn error_messages_match_their_snapshot() {
             principal: Some("carol@partner.example".into()),
         })
         .to_string(),
-        registry(Refusal::NotInRole {
-            service: svc.clone(),
-            allow: vec![analyst.clone()],
-            principal: None,
-        })
-        .to_string(),
         registry(Refusal::UnknownService(svc.clone())).to_string(),
         registry(Refusal::NobodyAllowed(svc.clone())).to_string(),
         GateRefusal::NotAssigned {
@@ -169,11 +163,11 @@ fn error_messages_match_their_snapshot() {
         GateRefusal::AlsoRequire {
             service: svc.clone(),
             roles: vec![analyst.clone()],
-            principal: Some("alice@example.com".into()),
+            principal: "alice@example.com".into(),
         }
         .to_string(),
         GateRefusal::Unvouched { version: v }.to_string(),
-        TOKEN_UNVERIFIED.to_owned(),
+        SIGN_IN_EXPIRED.to_owned(),
         IDP_UNREACHABLE.to_owned(),
         HOST_MISCONFIGURED.to_owned(),
     ];
@@ -182,8 +176,8 @@ fn error_messages_match_their_snapshot() {
         .map(|r| format!("wires: {} [exit 77]", help::refusal(r)))
         .collect();
     let call = crate::caller::call::not_callable;
-    lines.push(format!("wires: {} [exit 1]", call(&svc, true)));
-    lines.push(format!("wires: {} [exit 1]", call(&svc, false)));
+    lines.push(format!("wires: {} [exit 1]", call(&svc)));
+    lines.push(format!("wires: {} [exit 1]", help::NOT_SIGNED_IN));
     for refused in [
         Refused::Flag("--node-seed"),
         Refused::Env("WIRES_NODE_SEED"),
@@ -197,7 +191,7 @@ fn error_messages_match_their_snapshot() {
         panic!("no key there");
     };
     lines.push(format!("wires: {} [exit 1]", help::brief(&no_key)));
-    let Err(bad_token) = crate::caller::join::join_in(&ks, "not-a-token", 0) else {
+    let Err(bad_token) = crate::caller::join::join_in(&ks, "not-a-token") else {
         panic!("not a token");
     };
     lines.push(format!("wires: {} [exit 1]", help::brief(&bad_token)));
@@ -288,8 +282,8 @@ fn the_premise_is_short_and_in_the_right_words() {
 #[test]
 fn a_refusal_gets_one_next_step() {
     assert_eq!(
-        help::refusal("not a member of this network"),
-        "denied by host: not a member of this network; don't retry: ask your admin for access"
+        help::refusal("removed from this network"),
+        "denied by host: removed from this network; don't retry: ask your admin for access"
     );
     let login = "your ID token could not be verified; run `wires login`";
     assert_eq!(help::refusal(login), format!("denied by host: {login}"));

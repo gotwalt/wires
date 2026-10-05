@@ -15,8 +15,10 @@
 //!   environment and a per-call push capability, not the host's keystore.
 //! - [`gateway`] — `wires gateway`: a web MCP client signs in (OAuth, a mock
 //!   Google) and calls as its user, over real HTTP.
-//! - [`first_run`] — starting a network: `init`, `directory add`, `invite`,
-//!   `join`, `directory serve`, an edit, with no step failing.
+//! - [`first_run`] — card 41's first run from empty keystores (`init`, `role
+//!   set`, `directory add`, `service add`, `network`, `join`, `serve`,
+//!   `policy push`, `login <network>`, `services`, `call`), with no step
+//!   failing; then removal by person and by node, and `restore`.
 //! - [`follow`] — card 36c: hosts follow a directory's `policy`
 //!   subscription (deltas, resync, failover), and the signed freshness rule
 //!   (`lenient` / `strict`) with every directory down.
@@ -31,8 +33,8 @@ use std::time::Duration;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr};
 use library::{
-    Frame, Hello, HelloAck, Invocation, Matcher, Membership, NodeIdentity, OidcNonce, Policy,
-    RoleName, ServiceName, SignedPolicy, StateVersion,
+    Frame, Hello, HelloAck, Invocation, Matcher, NodeIdentity, OidcNonce, Policy, RoleName,
+    ServiceName, SignedPolicy, StateVersion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::timeout;
@@ -120,23 +122,22 @@ fn signed_state(root: &NodeIdentity, version: u64, edit: impl FnOnce(&mut Policy
     crate::testutil::signed_policy(root, s)
 }
 
-/// `who`'s badge under `root`, never expiring.
-fn membership(root: &NodeIdentity, who: &NodeIdentity) -> Membership {
-    Membership::mint(root, who.node_id(), 0, i64::MAX).unwrap()
-}
+/// The token a node that never signed in would have to make up: it
+/// doesn't verify.
+const NO_SIGN_IN: &str = "not.signed.in";
 
-/// `who`'s `Hello` under `root`: the policy version it holds, and a fresh ID
-/// token from `idp` when it is signed in there.
-fn hello(root: &NodeIdentity, who: &NodeIdentity, version: u64, idp: Option<&MockIdp>) -> Hello {
+/// `who`'s `Hello`: the policy version it holds, and a fresh ID token from
+/// `idp` bound to its key when it is signed in there (else [`NO_SIGN_IN`]).
+fn hello(who: &NodeIdentity, version: u64, idp: Option<&MockIdp>) -> Hello {
     Hello {
-        membership: membership(root, who),
         state_version: StateVersion(version),
-        id_token: idp.map(|idp| {
-            idp.mint(
+        id_token: match idp {
+            Some(idp) => idp.mint(
                 &OidcNonce::for_node(&who.node_id()),
                 crate::clock::now_unix() + 3600,
-            )
-        }),
+            ),
+            None => library::IdToken::new(NO_SIGN_IN),
+        },
     }
 }
 
@@ -161,7 +162,7 @@ fn hold_view(
     who: Option<&library::Principal>,
 ) {
     let held = crate::caller::view::HeldView::fetched(
-        state.view_for(who, None),
+        state.view_for(crate::testutil::any_node(), who, None),
         None,
         crate::clock::now_unix(),
     );

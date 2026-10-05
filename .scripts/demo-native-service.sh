@@ -11,7 +11,8 @@
 #   host   -- `kv.py` or `kv.mts`: the embedded host, implementing kv.
 #   agent  -- alice@example.com (role analyst): calls kv.
 #   other  -- bob@other.example: signed in, but in no role that may call kv.
-#   root   -- the admin: init, role set, invite, service add.
+#   root   -- the admin: init, role set, directory add, service add, network,
+#             and the first policy push (card 41's first run).
 #
 # The IdP is the hermetic loopback issuer (`wires dev-mock-idp`, only in the
 # `--features dev-mock-idp` build). Addressing is by key; the host writes its
@@ -96,8 +97,9 @@ wait_for() {
 	done
 	return 1
 }
+# Sign keystore $1 in as $2, joining the network string $3 first.
 login_as() {
-	WIRES_HOME="$1" "$WIRES" login --no-browser >"$D/login.out" 2>"$D/login.err" &
+	WIRES_HOME="$1" "$WIRES" login --no-browser "$3" >"$D/login.out" 2>"$D/login.err" &
 	local pid=$!
 	wait_for "$D/login.err" "sign in at" 100 || bad "login printed no sign-in URL"
 	local url
@@ -154,16 +156,13 @@ CLIENT_ID="$(awk '/^client_id /{print $2}' "$D/idp.out")"
 # The network's first policy trusts the IdP.
 WIRES_HOME="$root" "$WIRES" init --issuer "$ISSUER" --client-id "$CLIENT_ID" --public-client-secret not-so-secret >/dev/null
 HOST_ID="$(WIRES_HOME="$host" "$WIRES" id 2>/dev/null)"
-AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
-OT_ID="$(WIRES_HOME="$other" "$WIRES" id 2>/dev/null)"
 admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
 
-admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
-admin invite "$HOST_ID" --name nativehost >/dev/null 2>&1
+admin role set analyst '*@example.com' >/dev/null 2>&1
 # The host is also the network's directory (card 37: callers ask one for
-# their view). It isn't up yet, so the edits reach no directory, and a fresh
-# token carries the policy to the host.
-admin directory add nativehost >/dev/null 2>"$D/dir.err" || {
+# their view). It isn't up yet, so the edits reach no directory: it starts
+# empty and takes the admin's first publish.
+admin directory add "nativehost=$HOST_ID" >/dev/null 2>"$D/dir.err" || {
 	dump "$D/dir.err"
 	bad "wires directory add failed"
 }
@@ -172,7 +171,8 @@ admin service add kv --description "A key-value store, one namespace per person 
 	dump "$D/svc.err"
 	bad "wires service add failed"
 }
-WIRES_HOME="$host" "$WIRES" join "$(admin invite "$HOST_ID" --name nativehost 2>/dev/null)" >/dev/null
+NETWORK="$(admin network)"
+WIRES_HOME="$host" "$WIRES" join "$NETWORK" >/dev/null
 
 # --------------------------------------------------------------------------
 # The $LANG_NAME host.
@@ -192,20 +192,21 @@ wait_for "$host/run/hint" " " 300 || {
 }
 grep -qF "kv: serving as $HOST_ID" "$D/host.err" || bad "the $LANG_NAME host is not serving as its node key"
 for h in "$root" "$agent" "$other"; do cp "$host/run/hint" "$h/hints"; done
+# Its directory started empty: the admin's first publish gives it (and the
+# host) the policy that assigns it kv.
+admin policy push >/dev/null 2>"$D/push0.err" || {
+	dump "$D/push0.err"
+	bad "wires policy push failed"
+}
+grep -qF "published to 1 of 1" "$D/push0.err" || {
+	dump "$D/push0.err"
+	bad "the first publish did not reach the host's directory"
+}
 ok "the $LANG_NAME host serves kv as ${HOST_ID:0:8}... (pid $HOST_PID)"
 
-# The callers join. An invite mints a badge and edits nothing, so nothing is
-# published.
-AG_TOKEN="$(admin invite "$AG_ID" --name agent 2>"$D/invite.err")"
-OT_TOKEN="$(admin invite "$OT_ID" --name other 2>>"$D/invite.err")"
-! grep -qF "published to" "$D/invite.err" || {
-	dump "$D/invite.err"
-	bad "an invite published a policy"
-}
-WIRES_HOME="$agent" "$WIRES" join "$AG_TOKEN" >/dev/null
-WIRES_HOME="$other" "$WIRES" join "$OT_TOKEN" >/dev/null
-login_as "$agent" "$EMAIL"
-login_as "$other" "$OTHER"
+# Each caller's whole onboarding: `wires login <network>`.
+login_as "$agent" "$EMAIL" "$NETWORK"
+login_as "$other" "$OTHER" "$NETWORK"
 ok "the $LANG_NAME host serves the admin's signed policy; alice and bob signed in"
 
 # --------------------------------------------------------------------------

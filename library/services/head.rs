@@ -9,9 +9,10 @@
 //! [`SignedEntry`](crate::SignedEntry).)
 //!
 //! - **Signed bytes:** [`POLICY_HEAD_CONTEXT`] followed by the canonical JSON
-//!   of `{alg, head}`. The context separates it from service entries,
-//!   memberships and [`Fresh`](crate::Fresh).
-//! - **Format:** [`POLICY_V3`], a signed discriminant (formats 1 and 2 were
+//!   of `{alg, head}`. The context separates it from service entries
+//!   and [`Fresh`](crate::Fresh).
+//! - **Format:** [`POLICY_V4`], a signed discriminant (format 3 carried bans
+//!   with an `until`; formats 1 and 2 were
 //!   the signed state the policy replaced, card 36). Unknown fields are
 //!   refused at decode.
 //! - **Versioning:** [`StateVersion`] only goes up, and a node adopts a head
@@ -49,8 +50,9 @@ use crate::item::Item;
 #[serde(transparent)]
 pub struct StateVersion(pub u64);
 
-/// The policy head format: 3 (formats 1 and 2 were the retired signed state).
-pub const POLICY_V3: u8 = 3;
+/// The policy head format: 4 (format 3 banned nodes with an `until`; 1 and 2
+/// were the retired signed state).
+pub const POLICY_V4: u8 = 4;
 
 /// Domain-separation prefix of a head's signed bytes.
 pub const POLICY_HEAD_CONTEXT: &[u8] = b"wires/policy-head/v1\0";
@@ -94,7 +96,7 @@ impl ItemsHash {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyHead {
-    /// Format discriminant; [`POLICY_V3`]. Signed.
+    /// Format discriminant; [`POLICY_V4`]. Signed.
     pub format: u8,
     /// The root's node id: the authority, pinned by
     /// [`SignedPolicyHead::verify`].
@@ -172,7 +174,7 @@ impl SignedPolicyHead {
         if self.alg != AlgorithmId::Ed25519 {
             return Err(Error::UnsupportedAlgorithm);
         }
-        if self.head.format != POLICY_V3 {
+        if self.head.format != POLICY_V4 {
             return Err(Error::UnsupportedVersion);
         }
         if self.head.fabric != root {
@@ -244,7 +246,7 @@ mod tests {
 
     fn sample() -> PolicyHead {
         PolicyHead {
-            format: POLICY_V3,
+            format: POLICY_V4,
             fabric: root().node_id(),
             version: StateVersion(3),
             issued: 10,
@@ -306,7 +308,7 @@ mod tests {
     #[test]
     fn format_and_duplicate_directories_are_refused() {
         let mut h = sample();
-        h.format = POLICY_V3 + 1;
+        h.format = POLICY_V4 - 1;
         let signed = SignedPolicyHead {
             sig: root().sign(&signed_bytes(&h, &AlgorithmId::Ed25519).unwrap()),
             head: h,
@@ -371,12 +373,9 @@ mod tests {
 
     #[test]
     fn the_items_hash_is_domain_separated_and_ordered() {
-        use crate::item::{Ban, Settings};
+        use crate::item::Settings;
         let items = vec![
-            Item::Ban {
-                key: node(2),
-                body: Ban { until: 5 },
-            },
+            Item::Ban { key: node(2) },
             Item::Settings {
                 body: Settings::default(),
             },

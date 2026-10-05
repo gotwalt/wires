@@ -18,11 +18,13 @@
 //! # Who may receive
 //!
 //! The host's **signed policy** decides, asked **at send, at delivery and at
-//! fetch** ([`ServicesHost::decide_push`]): the recipient must not be banned
-//! by the current policy, and must be in a registry role that `host.json`'s
-//! `push.allow` names (default: nobody). A removed (banned) node gets
-//! nothing: its queue is dropped (traced `denied`), and its fetch is
-//! refused. A fetch also presents the fetcher's badge, checked first.
+//! fetch** ([`ServicesHost::decide_push`]): neither the recipient's node nor
+//! the person it verified as here may be banned by the current policy, and
+//! it must be in a registry role that `host.json`'s `push.allow` names
+//! (default: nobody). A removed (banned) node or person gets nothing: its
+//! queue is dropped (traced `denied`), and its fetch is refused. A fetch is
+//! admitted like a call, first: its `Hello` carries the fetcher's ID token,
+//! which must verify, and the bans are checked.
 //!
 //! **The identity rule.** Every role needs the recipient's verified
 //! principal (there is no role that admits without one), and a host only knows
@@ -571,12 +573,10 @@ impl PushHost {
         Ok(gone.into_iter().map(|e| e.message.id).collect())
     }
 
-    /// This host's `Hello`: its membership (a host presents no ID token).
+    /// This host's `Hello`: empty (a host acts for no person; the receiver
+    /// admits it because it hosts a service in the receiver's view).
     fn hello(&self) -> InboxFrame {
-        InboxFrame::Hello {
-            membership: self.host.membership.clone(),
-            id_token: None,
-        }
+        InboxFrame::Hello { id_token: None }
     }
 
     /// A slot for one more long poll from `node`, if it has fewer than
@@ -596,12 +596,13 @@ impl PushHost {
     ///
     /// Before the caller is known to be admitted, at most
     /// [`MAX_PREAUTH_FETCHES`] fetches are read at once and each opening
-    /// frame is at most [`MAX_INBOX_HELLO`]. Membership is checked before
-    /// the ID token is verified (its badge, and the policy's bans); a peer
-    /// that is not admitted hears only
-    /// [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED) and is traced,
-    /// throttled (its queue, if it had one before it was banned, is dropped
-    /// and each message's fate traced). An admitted node's policy refusal is
+    /// frame is at most [`MAX_INBOX_HELLO`]. The fetch is admitted like a
+    /// call ([`ServicesHost::admit_caller`]: its `Hello`'s ID token verifies,
+    /// and neither the node nor the person is banned); a peer that is not
+    /// admitted hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED)
+    /// (or that its sign-in expired, or the IdP is unreachable) and is
+    /// traced, throttled (a banned node's queue is dropped and each
+    /// message's fate traced). An admitted node's policy refusal is
     /// only answered: `wires inbox` asks every host of the node's services,
     /// and a host it may not hear from would otherwise trace it on every
     /// poll. A node holds at most [`MAX_FETCHES_PER_NODE`] long polls open.
@@ -624,22 +625,18 @@ impl PushHost {
             deny(&mut send, "this host is busy; try again").await;
             return Ok(());
         };
-        let (membership, id_token) =
-            match read_frame_within(&mut recv, FRAME_TIMEOUT, MAX_INBOX_HELLO).await {
-                Ok(Some(InboxFrame::Hello {
-                    membership,
-                    id_token,
-                })) => (membership, id_token),
-                other => {
-                    let detail = match other {
-                        Err(e) => format!("unreadable hello: {e:#}"),
-                        _ => "expected hello".to_string(),
-                    };
-                    FETCH_STRANGERS.refused("inbox fetch", caller, &detail);
-                    deny(&mut send, "expected hello").await;
-                    return Ok(());
-                }
-            };
+        let id_token = match read_frame_within(&mut recv, FRAME_TIMEOUT, MAX_INBOX_HELLO).await {
+            Ok(Some(InboxFrame::Hello { id_token })) => id_token,
+            other => {
+                let detail = match other {
+                    Err(e) => format!("unreadable hello: {e:#}"),
+                    _ => "expected hello".to_string(),
+                };
+                FETCH_STRANGERS.refused("inbox fetch", caller, &detail);
+                deny(&mut send, "expected hello").await;
+                return Ok(());
+            }
+        };
         let wait_ms = match read_frame_within(&mut recv, FRAME_TIMEOUT, MAX_INBOX_HELLO).await {
             Ok(Some(InboxFrame::Fetch { wait_ms })) => wait_ms,
             other => {
@@ -661,18 +658,23 @@ impl PushHost {
                 return Ok(());
             }
         };
-        // Membership first: a stranger costs no token verification.
-        if let Err(detail) = self.host.check_member(&state, &membership, caller, now) {
+        // Admission first, as for a call: the fetcher's ID token (from
+        // `wires login`) must verify, which is also how this host learns who
+        // it is, and so its roles; then the bans.
+        let admitted = match &id_token {
+            Some(token) => self.host.admit_caller(&state, caller, token, now).await,
+            None => Err((
+                crate::host::gate::NOT_ADMITTED,
+                "no ID token presented".to_string(),
+            )),
+        };
+        if let Err((reason, detail)) = admitted {
             FETCH_STRANGERS.refused("inbox fetch", caller, &detail);
-            self.drop_queue(caller, &detail);
-            deny(&mut send, crate::host::gate::NOT_ADMITTED).await;
+            if state.policy.bans_node(caller) {
+                self.drop_queue(caller, &detail);
+            }
+            deny(&mut send, reason).await;
             return Ok(());
-        }
-        // The fetcher's ID token (from `wires login`) is how this host learns
-        // who it is, and so its roles: verified and indexed before the push
-        // rule is asked.
-        if let Some(token) = &id_token {
-            let _ = self.host.identities.verify_token(caller, token, now).await;
         }
         match self.authorize(caller, now) {
             Ok(_) => {}
@@ -1003,7 +1005,7 @@ mod tests {
     /// `serve` isn't preflighted.)
     fn push_host() -> Arc<PushHost> {
         use crate::admin::keystore::Keystore;
-        use library::{Membership, Policy, StateVersion};
+        use library::{Policy, StateVersion};
         let root = NodeIdentity::from_seed([1u8; 32]);
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
@@ -1012,7 +1014,7 @@ mod tests {
         s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
         for seed in 50..55u8 {
-            s.ban(node(seed), i64::MAX);
+            s.ban(node(seed));
         }
         let signed = crate::testutil::signed_policy(&root, s);
         crate::policy::store::adopt_if_newer(
@@ -1026,13 +1028,8 @@ mod tests {
             r#"{"version":2,"services":{"t":{"command":["true"]}},"push":{"allow":["analyst"]}}"#,
         )
         .unwrap();
-        let host = crate::host::serve::services_host(
-            node(4),
-            Membership::mint(&root, node(4), 0, i64::MAX).unwrap(),
-            Arc::new(ks),
-            config,
-        )
-        .unwrap();
+        let host = crate::host::serve::services_host(node(4), root.node_id(), Arc::new(ks), config)
+            .unwrap();
         Arc::new(PushHost::from_state(Arc::new(host)))
     }
 
@@ -1048,30 +1045,43 @@ mod tests {
         }
     }
 
-    /// A fetch from a banned key (50–54: a genuine badge), or with another
-    /// network's badge (55–59), hears the fixed sentence and has its token
-    /// left unverified.
+    /// A fetch with no ID token (55), a forged one (56–59), or from a
+    /// banned key with a genuine token bound to it (50–54) hears the fixed
+    /// sentence, and only a token that verified leaves an identity behind.
     #[tokio::test]
-    async fn a_banned_or_badgeless_fetch_is_refused_and_unverified() {
+    async fn a_fetch_without_a_valid_sign_in_or_from_a_banned_node_is_refused() {
         let push = push_host();
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let rogue = NodeIdentity::from_seed([66u8; 32]);
+        // The push host's policy trusts no issuer yet: give it the test IdP.
+        push.host
+            .identities
+            .set_trust(crate::host::identity::IdpTrust::per_issuer(vec![(
+                crate::testutil::test_idp().issuer.clone(),
+                vec![library::Audience::new(
+                    crate::caller::mock_idp::MOCK_CLIENT_ID,
+                )],
+            )]));
         for seed in 50..60u8 {
             let who = node(seed);
-            let issuer = if seed < 55 { &root } else { &rogue };
-            let mut bytes = InboxFrame::Hello {
-                membership: library::Membership::mint(issuer, who, 0, i64::MAX).unwrap(),
-                id_token: Some(library::IdToken::new(
+            let id_token = match seed {
+                50..55 => Some(crate::testutil::test_id_token(&who)),
+                55 => None,
+                _ => Some(library::IdToken::new(
                     "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIn0.",
                 )),
-            }
-            .encode()
-            .unwrap();
+            };
+            let mut bytes = InboxFrame::Hello { id_token }.encode().unwrap();
             bytes.extend(InboxFrame::Fetch { wait_ms: 0 }.encode().unwrap());
             let r = fetch_refusal(&push, bytes, who).await;
-            assert_eq!(r, crate::host::gate::NOT_ADMITTED);
+            assert_eq!(r, crate::host::gate::NOT_ADMITTED, "{seed}");
         }
-        assert!(push.host.identities.nodes().is_empty());
+        assert!(
+            push.host
+                .identities
+                .nodes()
+                .iter()
+                .all(|n| (50..55u8).any(|s| node(s) == *n)),
+            "only genuine tokens leave an identity"
+        );
     }
 
     /// Card 35: a push to a banned node is refused at send (traced
@@ -1094,7 +1104,7 @@ mod tests {
         let r = &report.results[0];
         assert_eq!(r.outcome, PushOutcome::Denied);
         assert!(
-            r.reason.as_deref().unwrap_or_default().contains("banned"),
+            r.reason.as_deref().unwrap_or_default().contains("removed"),
             "{r:?}"
         );
         assert!(
@@ -1106,7 +1116,7 @@ mod tests {
         );
         let traced = lines.matching("push denied");
         assert_eq!(traced.len(), 1, "{}", lines.text());
-        assert!(traced[0].contains("banned"), "{}", traced[0]);
+        assert!(traced[0].contains("removed"), "{}", traced[0]);
         assert!(!traced[0].contains("body"), "{}", traced[0]);
     }
 

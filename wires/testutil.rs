@@ -144,3 +144,35 @@ pub(crate) fn test_identity_json() -> String {
         crate::caller::mock_idp::MOCK_CLIENT_ID
     )
 }
+
+/// The network string of `root`'s network, naming `directories` and
+/// [`test_idp`] as the IdP to sign in with.
+pub(crate) fn network(
+    root: &library::NodeIdentity,
+    directories: &[library::NodeId],
+) -> library::Network {
+    library::Network::new(
+        root.node_id(),
+        directories.to_vec(),
+        library::LoginSettings {
+            issuer: test_idp().issuer.clone(),
+            client_id: library::Audience::new(crate::caller::mock_idp::MOCK_CLIENT_ID),
+            public_client_secret: None,
+        },
+    )
+}
+
+/// Join `ks` to `root`'s network ([`network`]), as `wires join` does.
+pub(crate) fn join(
+    ks: &crate::admin::keystore::Keystore,
+    root: &library::NodeIdentity,
+    directories: &[library::NodeId],
+) {
+    ks.save_network(&network(root, directories)).unwrap();
+}
+
+/// A node no test policy bans, to cut a view for when the node doesn't
+/// matter (a view depends on the node only through a node ban).
+pub(crate) fn any_node() -> library::NodeId {
+    library::NodeIdentity::from_seed([0xee; 32]).node_id()
+}

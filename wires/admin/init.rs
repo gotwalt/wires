@@ -1,28 +1,23 @@
 //! `wires init`: a new network in one step.
 //!
-//! Creates the root key and this machine's node key in one keystore, mints
-//! this node's badge (its membership: the admin's node is admitted like any
-//! other, which is what lets it publish every later policy to the
-//! directories by key), records it in the ledger, and signs the first
+//! Creates the root key and this machine's node key (what it dials the
+//! directories with when it publishes) in one keystore, and signs the first
 //! policy: one trusted IdP (its `issuer` item, Google unless `--issuer`
 //! says otherwise: every role's matchers must name a trusted issuer), no
-//! roles, no services, no bans, no directories yet.
+//! roles, no services, no bans, no directories yet. Nothing is minted for
+//! any node and nothing is published: the network string (`wires network`)
+//! is what every other node joins with.
 
 use anyhow::{Context, bail};
 use clap::Args;
-use library::{GOOGLE_ISSUER, Issuer, Membership, NodeIdentity};
+use library::{GOOGLE_ISSUER, Issuer, NodeIdentity};
 
 use super::keystore::Keystore;
-use super::ledger::Ledger;
 use super::ttl::Ttl;
-use crate::clock::now_unix;
 
 /// `init` arguments.
 #[derive(Args)]
 pub(crate) struct InitArgs {
-    /// Lifetime of this node's badge (`30d`, `12h`, … or seconds; at most 30d).
-    #[arg(long, default_value = Ttl::DEFAULT)]
-    pub(crate) ttl: Ttl,
     /// Lifetime of the first signed policy.
     #[arg(long, default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) policy_ttl: Ttl,
@@ -35,7 +30,7 @@ pub(crate) struct InitArgs {
     /// An `aud` value hosts accept from that IdP (repeatable; default: the client id).
     #[arg(long = "audience")]
     pub(crate) audience: Vec<String>,
-    /// That client's public secret, which invites carry to `wires login`.
+    /// That client's public secret, which the network string carries to `wires login`.
     // A Google "Desktop app" client's, which its token endpoint requires and
     // which is not confidential. Never pass a confidential secret.
     #[arg(long)]
@@ -47,7 +42,6 @@ impl Default for InitArgs {
     /// The default lifetimes, Google, and a test client id.
     fn default() -> Self {
         Self {
-            ttl: Ttl::default(),
             policy_ttl: Ttl::policy_default(),
             issuer: GOOGLE_ISSUER.to_string(),
             client_id: Some("wires-test-client".into()),
@@ -64,7 +58,7 @@ pub(crate) fn init_cmd(a: InitArgs) -> anyhow::Result<String> {
 
 /// [`init_cmd`] against an explicit keystore (the testable form).
 pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
-    if let Some(fabric) = crate::policy::store::fabric(ks)? {
+    if let Some(fabric) = ks.network_root()? {
         bail!(
             "this keystore is already in network {}…; `wires init` starts a new network — use \
              another $WIRES_HOME for that",
@@ -102,23 +96,17 @@ pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
         }
     };
 
-    let now = now_unix();
-    let badge = Membership::mint(&root, me.node_id(), now, a.ttl.badge()?.not_after(now))?;
-    ks.save_membership(&badge)?;
-    let mut ledger = Ledger::load(ks)?;
-    ledger.record(me.node_id(), None, badge.not_after);
-    ledger.save(ks)?;
     let held = super::service::first_policy(ks, a.policy_ttl, |p| {
         p.issuers.insert(issuer.clone(), config);
         Ok(())
     })?;
-    // Card 37: invites tell `wires login` to sign in here.
+    // The network string tells `wires login` to sign in here.
     super::login_client::LoginClient::record(ks, &issuer, a.public_client_secret.as_deref(), true)?;
 
     Ok(format!(
-        "network {}\nnode {}\npolicy version {} (trusts {issuer})\n\
-         next: on each joining machine run `wires id`; list the directory node first with \
-         `wires directory add <node-id>`, then `wires invite <node-id> --name <label>` each machine",
+        "network {}\nnode {}\npolicy version {} (trusts {issuer}), stored here\n\
+         next: run `wires id` on the machine that will be the directory, then `wires directory \
+         add <label>=<node id>` here; `wires network` prints the string every node joins with",
         root.node_id().hex(),
         me.node_id().hex(),
         held.version().0,
@@ -131,7 +119,7 @@ mod tests {
     use crate::testutil::temp_dir;
 
     #[test]
-    fn init_badges_this_node_and_signs_a_policy_trusting_one_idp() {
+    fn init_makes_the_keys_and_signs_a_policy_trusting_one_idp() {
         let ks = Keystore::at(temp_dir());
         let out = init_in(&ks, InitArgs::default()).unwrap();
         let root = ks.read_root_identity().unwrap().unwrap();
@@ -139,9 +127,9 @@ mod tests {
         assert!(out.contains(&root.node_id().hex()), "{out}");
         assert!(out.contains(&me.node_id().hex()), "{out}");
 
-        let membership = ks.read_membership().unwrap().unwrap();
-        assert_eq!(membership.member, me.node_id());
-        assert_eq!(membership.fabric, root.node_id());
+        // Nothing minted, nothing joined: the root key names the network.
+        assert!(ks.read_network().unwrap().is_none());
+        assert_eq!(ks.network_root().unwrap(), Some(root.node_id()));
         let held = crate::policy::store::read(&ks, root.node_id())
             .unwrap()
             .unwrap();
@@ -153,12 +141,7 @@ mod tests {
         assert_eq!(google.client_id.as_str(), "wires-test-client");
         assert_eq!(google.audiences, vec![google.client_id.clone()]);
         // 90 days by default: freshness, not expiry, keeps copies current.
-        assert!(held.policy.not_after >= now_unix() + 89 * 86_400);
-        let ledger = Ledger::load(&ks).unwrap();
-        assert_eq!(
-            ledger.get(me.node_id()).map(|i| i.not_after),
-            Some(membership.not_after)
-        );
+        assert!(held.policy.not_after >= crate::clock::now_unix() + 89 * 86_400);
     }
 
     #[test]

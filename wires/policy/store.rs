@@ -61,10 +61,9 @@ impl Held {
     }
 }
 
-/// [`read`], required to exist (for a membership resolved elsewhere, such as
-/// a `--membership` flag).
+/// [`read`], required to exist (the admin's, which every edit starts from).
 pub(crate) fn require_policy(ks: &Keystore, root: NodeId) -> Result<Held> {
-    read(ks, root)?.context("this node holds no signed policy yet: run `wires join <token>` first")
+    read(ks, root)?.context("this node holds no signed policy yet (`wires init` signs the first)")
 }
 
 /// The stored policy, verified under `root`; `None` if this node has none
@@ -125,10 +124,10 @@ pub(crate) fn adopt_if_newer(
     Ok(true)
 }
 
-/// The network root this keystore belongs to (its membership's `fabric`);
-/// `None` before `init` or `join`.
+/// The network root this keystore belongs to
+/// ([`Keystore::network_root`]); `None` before `init`, `join` or `login`.
 pub(crate) fn fabric(ks: &Keystore) -> Result<Option<NodeId>> {
-    Ok(ks.read_membership()?.map(|m| m.fabric))
+    ks.network_root()
 }
 
 #[cfg(test)]

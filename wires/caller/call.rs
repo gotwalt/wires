@@ -3,14 +3,15 @@
 //! The name is a **service** (card 27): its hosts come from the service's
 //! root-signed entry in this node's view (card 37), tried last-good first
 //! with failover on a dial failure ([`crate::caller::pick`]), and the
-//! session opens with the card-27 [`Hello`] (membership, the view's head
-//! version, ID token). A name the view doesn't hold is asked of a directory
-//! (`resolve`) before the call fails; nothing is dialed from an expired
-//! view. When a host's `HelloAck` reports a newer head, it carries the
+//! session opens with the [`Hello`] (the view's head version, and the ID
+//! token `wires login` stored: no token, no call). A name the view doesn't
+//! hold is asked of a directory (`resolve`) before the call fails; nothing
+//! is dialed from an expired view, and a view older than a day is refreshed
+//! first. When a host's `HelloAck` reports a newer head, it carries the
 //! head and the service's entry, and the call stops there, **before** any
 //! stdin is sent, unless that entry still lists the host; the caller then
-//! refreshes its view after the call. On an unchanged fabric the call is
-//! the only connection. A service in the view wins over a `tools.json`
+//! refreshes its view after the call. On an unchanged fabric, within a day
+//! of the last refresh, the call is the only connection. A service in the view wins over a `tools.json`
 //! alias of the same name; an alias pins a name to one host (and address
 //! hints), which the view's entry for the alias's service must list, and
 //! that host still decides by its signed policy.
@@ -37,8 +38,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use library::{
-    Argv, Hello, HelloAck, IdToken, Invocation, Membership, NodeId, NodeIdentity, ServiceName,
-    SignedEntry, StateVersion,
+    Argv, Hello, HelloAck, IdToken, Invocation, NodeId, NodeIdentity, ServiceName, SignedEntry,
+    StateVersion,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -130,32 +131,46 @@ impl Dial {
     }
 }
 
-/// This node's credentials for dialing: the node key and its membership,
-/// plus the ID token to present when it isn't the one `wires login` stored.
+/// This node's credentials for dialing: the node key and the network's
+/// root key, plus the ID token to present when it isn't the one `wires
+/// login` stored. The ID token is the only credential: there is nothing the
+/// admin minted for this node.
 #[derive(Clone)]
 pub struct Credentials {
     node: Arc<NodeIdentity>,
-    membership: Membership,
+    root: NodeId,
     relay_override: Option<String>,
     id_token: Option<IdToken>,
 }
 
 impl Credentials {
-    /// Resolve credentials the way `wires serve` does (flag, env, file,
-    /// keystore).
+    /// Resolve the node key the way `wires serve` does (flag, env, file,
+    /// keystore) and the network from the keystore.
     pub fn resolve(a: &CredArgs) -> Result<Self> {
+        let root = Keystore::resolve()?
+            .network_root()?
+            .context(crate::help::NOT_JOINED)?;
         Ok(Self {
             node: Arc::new(keystore::node_identity(
                 a.node_seed.as_deref(),
                 a.node_seed_file.as_deref(),
             )?),
-            membership: keystore::membership(
-                a.membership.as_deref(),
-                a.membership_file.as_deref(),
-            )?,
+            root,
             relay_override: a.relay_url.clone(),
             id_token: None,
         })
+    }
+
+    /// Credentials for `node` in the network rooted at `root`, from no flags
+    /// and no keystore (the tests' form).
+    #[cfg(test)]
+    pub(crate) fn of(node: NodeIdentity, root: NodeId) -> Self {
+        Self {
+            node: Arc::new(node),
+            root,
+            relay_override: None,
+            id_token: None,
+        }
     }
 
     /// Present `token` in the session `Hello` instead of the stored one.
@@ -173,19 +188,14 @@ impl Credentials {
         self.node.node_id()
     }
 
-    /// This node's badge.
-    pub(crate) fn membership(&self) -> &Membership {
-        &self.membership
-    }
-
     /// The `--relay-url` override, if any.
     pub(crate) fn relay(&self) -> Option<&str> {
         self.relay_override.as_deref()
     }
 
-    /// The network root this node's membership names.
+    /// The network's root key.
     pub(crate) fn fabric(&self) -> NodeId {
-        self.membership.fabric
+        self.root
     }
 
     /// The ID token to present: [`presenting`](Self::presenting)'s, else
@@ -202,16 +212,20 @@ impl Credentials {
         transport::bind(&self.node, self.relay_override.as_deref()).await
     }
 
-    /// The session [`Hello`] to open with, after a local preflight (so a
-    /// membership issued to another node fails here, not at the host): the
-    /// membership, `version` (the head version of the view the call is
-    /// made from), and the ID token ([`id_token`](Self::id_token)).
+    /// The ID token to present, or the error saying to sign in: with none,
+    /// nothing is dialed (every host would refuse the call).
+    pub(crate) fn require_token(&self, ks: &Keystore) -> Result<IdToken> {
+        self.id_token(ks)
+            .ok_or_else(|| anyhow!(crate::help::NOT_SIGNED_IN))
+    }
+
+    /// The session [`Hello`] to open with: `version` (the head version of
+    /// the view the call is made from), and the ID token
+    /// ([`require_token`](Self::require_token)).
     fn hello(&self, ks: &Keystore, version: StateVersion) -> Result<Hello> {
-        keystore::preflight(self.node.node_id(), &self.membership).map_err(anyhow::Error::msg)?;
         Ok(Hello {
-            membership: self.membership.clone(),
             state_version: version,
-            id_token: self.id_token(ks),
+            id_token: self.require_token(ks)?,
         })
     }
 }
@@ -221,10 +235,8 @@ impl Credentials {
 /// [`Hello`] a service call does, so the host still decides
 /// by its signed policy. A refusal surfaces as a [`transport::Denied`] error.
 ///
-/// Runs a local preflight first, so a membership issued to another node
-/// fails here, not at the host; and refuses, before dialing, an expired
-/// view or a pinned host the view's entry for the alias's service doesn't
-/// list.
+/// Refuses, before dialing, a node with no ID token, an expired view, or a
+/// pinned host the view's entry for the alias's service doesn't list.
 pub async fn dial<R, W, E>(
     creds: &Credentials,
     plan: Dial,
@@ -238,6 +250,7 @@ where
     E: AsyncWrite + Unpin,
 {
     let ks = Keystore::resolve()?;
+    creds.require_token(&ks)?;
     let held = usable_view(&ks, creds).await?;
     let hello = creds.hello(&ks, held.version())?;
     check_alias(&held, &plan)?;
@@ -245,7 +258,7 @@ where
     let relay = creds.relay_override.clone().or(plan.relay_url);
     let target = transport::endpoint_addr(&plan.target, &plan.addrs, relay.as_deref())?;
     let endpoint = transport::bind(&creds.node, relay.as_deref()).await?;
-    let fabric = creds.membership.fabric;
+    let fabric = creds.root;
     let held_version = held.version();
     let done = transport::call_service_on(
         &endpoint,
@@ -338,22 +351,35 @@ pub(crate) fn outcome(
 /// This node's view, verified under its network root, required to exist and
 /// to be fresh: a caller never dials from an expired view (it would name
 /// hosts the admin may have since removed). A missing or expired view is
-/// refreshed from a directory first.
+/// refreshed from a directory first, and so is a stale one
+/// ([`HeldView::is_stale`]: older than a day, or a host reported a newer
+/// head), which bounds how long a host the admin removed can still be
+/// dialed from it; a stale view still fresh is used when no directory
+/// answers.
 pub(crate) async fn usable_view(ks: &Keystore, creds: &Credentials) -> Result<HeldView> {
     let now = crate::clock::now_unix();
-    if let Some(held) = view::read(ks, creds.fabric())?
-        && held.view.head.check_fresh(now).is_ok()
+    let held =
+        view::read(ks, creds.fabric())?.filter(|held| held.view.head.check_fresh(now).is_ok());
+    if let Some(held) = &held
+        && !held.is_stale(now)
     {
-        return Ok(held);
+        return Ok(held.clone());
     }
-    let refreshed = view::refresh_now(ks, &creds.node, &creds.membership, creds.relay(), false)
-        .await
-        .context(
+    let refreshed = view::refresh_now(ks, &creds.node, creds.root, creds.relay(), false).await;
+    match (refreshed, held) {
+        (Ok(refreshed), _) => {
+            check_fresh(&refreshed, now)?;
+            Ok(refreshed)
+        }
+        (Err(e), Some(held)) => {
+            tracing::debug!("refreshing a stale view: {e:#}; calling from it as it is");
+            Ok(held)
+        }
+        (Err(e), None) => Err(e.context(
             "this node holds no current view of its services, and no directory gave it one: \
-             run `wires login` (or ask the admin for a fresh invite)",
-        )?;
-    check_fresh(&refreshed, now)?;
-    Ok(refreshed)
+             run `wires login` (or ask the admin to run `wires policy push`)",
+        )),
+    }
 }
 
 /// Refuse an expired view, saying what to do about it.
@@ -361,8 +387,7 @@ fn check_fresh(held: &HeldView, now: i64) -> Result<()> {
     if held.view.head.check_fresh(now).is_err() {
         bail!(
             "this node's view (policy version {}) has expired and no newer one could be \
-             fetched, so nothing was dialed; ask the admin to run `wires policy push` (or for a \
-             fresh invite)",
+             fetched, so nothing was dialed; ask the admin to run `wires policy push`",
             held.version().0
         );
     }
@@ -496,6 +521,7 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
+    creds.require_token(ks)?;
     let entry = match held.entry(service) {
         Some(e) => e.clone(),
         None => resolve_entry(creds, ks, dial.endpoint, service).await?,
@@ -518,7 +544,7 @@ where
         if opts.refresh_after {
             let asker = view::Asker {
                 endpoint: dial.endpoint,
-                badge: &creds.membership,
+                root: creds.root,
                 id_token: creds.id_token(ks),
             };
             let refreshed =
@@ -541,18 +567,16 @@ async fn resolve_entry(
     endpoint: &iroh::Endpoint,
     service: &ServiceName,
 ) -> Result<SignedEntry> {
-    let id_token = creds.id_token(ks);
-    let signed_in = id_token.is_some();
     let asker = view::Asker {
         endpoint,
-        badge: &creds.membership,
-        id_token,
+        root: creds.root,
+        id_token: Some(creds.require_token(ks)?),
     };
     let found = tokio::time::timeout(view::REFRESH_BUDGET, view::resolve(ks, &asker, service))
         .await
         .unwrap_or_else(|_| Err(anyhow!("no directory answered")));
     match found {
-        Ok(found) => found.ok_or_else(|| not_callable(service, signed_in)),
+        Ok(found) => found.ok_or_else(|| not_callable(service)),
         Err(e) => Err(e.context(format!(
             "`{service}` is not in this node's view, and no directory could be asked"
         ))),
@@ -561,15 +585,8 @@ async fn resolve_entry(
 
 /// Why `wires call <service>` has nothing to dial: no service by that name
 /// that this caller may call (a directory said so), and the next step.
-pub(crate) fn not_callable(service: &ServiceName, signed_in: bool) -> anyhow::Error {
-    if signed_in {
-        anyhow!("no service named `{service}` that you may call; see `wires services`")
-    } else {
-        anyhow!(
-            "no service named `{service}` that you may call: this node is not signed in, and \
-             every service needs a verified identity; run `wires login`"
-        )
-    }
+pub(crate) fn not_callable(service: &ServiceName) -> anyhow::Error {
+    anyhow!("no service named `{service}` that you may call; see `wires services`")
 }
 
 /// How [`call_entry`] reaches hosts.
@@ -621,7 +638,7 @@ where
         bail!("no service named `{service}` with a host; see `wires services`");
     }
     let targets = dial.hints.targets(&hosts, creds.relay_override.as_deref());
-    let fabric = creds.membership.fabric;
+    let fabric = creds.root;
     let mut reported = StateVersion(0);
     let done = transport::call_service_on(
         dial.endpoint,
@@ -667,13 +684,6 @@ pub struct CredArgs {
     /// Read the node key seed (hex) from this file instead of the keystore.
     #[arg(long, hide = true)]
     pub node_seed_file: Option<PathBuf>,
-    /// The base64 membership token to present. Falls back to
-    /// `$WIRES_MEMBERSHIP`, then `--membership-file`, then the keystore.
-    #[arg(long, hide = true)]
-    pub membership: Option<String>,
-    /// Read the membership token from this file instead of the keystore.
-    #[arg(long, hide = true)]
-    pub membership_file: Option<PathBuf>,
     /// Dial through this relay, overriding an alias's own.
     #[arg(long, hide = true)]
     pub relay_url: Option<String>,
@@ -1093,7 +1103,7 @@ mod tests {
         .unwrap();
         let host = crate::host::serve::services_host(
             server.node_id(),
-            Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
+            root.node_id(),
             std::sync::Arc::new(ks),
             config,
         )
@@ -1112,9 +1122,8 @@ mod tests {
                 std::slice::from_ref(&target),
                 SERVICE_DIAL_TIMEOUT,
                 Hello {
-                    membership: Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap(),
                     state_version: StateVersion(1),
-                    id_token: Some(crate::testutil::test_id_token(&client.node_id())),
+                    id_token: crate::testutil::test_id_token(&client.node_id()),
                 },
                 Invocation {
                     service: ServiceName::new(name).unwrap(),
@@ -1193,14 +1202,9 @@ mod tests {
     type Seen = std::sync::Arc<std::sync::Mutex<Vec<library::Hello>>>;
 
     /// The ack a host holding `policy` gives a caller at `caller_version`.
-    fn ack_for(
-        membership: &Membership,
-        policy: Option<&SignedPolicy>,
-        caller_version: StateVersion,
-    ) -> library::HelloAck {
+    fn ack_for(policy: Option<&SignedPolicy>, caller_version: StateVersion) -> library::HelloAck {
         let Some(policy) = policy else {
             return library::HelloAck {
-                membership: membership.clone(),
                 state_version: caller_version,
                 head: None,
                 entry: None,
@@ -1208,7 +1212,6 @@ mod tests {
         };
         let news = policy.version() > caller_version;
         library::HelloAck {
-            membership: membership.clone(),
             state_version: policy.version(),
             head: news.then(|| policy.head.clone()),
             entry: news
@@ -1224,16 +1227,11 @@ mod tests {
 
     /// A loopback host speaking just enough of the session protocol: it
     /// records each `Hello` it receives and answers per `answer`.
-    async fn fake_host(
-        root: &NodeIdentity,
-        me: &NodeIdentity,
-        answer: Answer,
-    ) -> (NodeId, SocketAddr, Seen) {
+    async fn fake_host(me: &NodeIdentity, answer: Answer) -> (NodeId, SocketAddr, Seen) {
         use library::{Chunk, Frame};
         let seen: Seen = Default::default();
         let ep = test_endpoint(me).await;
         let addr = loopback(&ep);
-        let membership = Membership::mint(root, me.node_id(), 0, i64::MAX).unwrap();
         let log = seen.clone();
         tokio::spawn(async move {
             while let Some(incoming) = ep.accept().await {
@@ -1255,14 +1253,14 @@ mod tests {
                         let _ = transport::write_frame(&mut send, &denied).await;
                     }
                     Answer::Run { out, policy } => {
-                        let ack = ack_for(&membership, policy.as_ref(), caller_version);
+                        let ack = ack_for(policy.as_ref(), caller_version);
                         let _ = transport::write_frame(&mut send, &Frame::HelloAck(ack)).await;
                         let chunk = Chunk::from_bytes(out.as_bytes().to_vec());
                         let _ = transport::write_frame(&mut send, &Frame::Stdout(chunk)).await;
                         let _ = transport::write_frame(&mut send, &Frame::Exit(0)).await;
                     }
                     Answer::Echo { policy, got } => {
-                        let ack = ack_for(&membership, Some(policy), caller_version);
+                        let ack = ack_for(Some(policy), caller_version);
                         let _ = transport::write_frame(&mut send, &Frame::HelloAck(ack)).await;
                         while let Ok(Some(Frame::Stdin(chunk))) =
                             transport::read_frame(&mut recv).await
@@ -1347,7 +1345,11 @@ mod tests {
 
     /// `signed`'s view for [`me`], as this node holds it (and stored).
     fn held(f: &Fixture, signed: &SignedPolicy) -> HeldView {
-        let held = HeldView::fetched(signed.view_for(Some(&me()), None), None, 10);
+        let held = HeldView::fetched(
+            signed.view_for(crate::testutil::any_node(), Some(&me()), None),
+            None,
+            10,
+        );
         view::write(&f.ks, f.root.node_id(), &held).unwrap();
         held
     }
@@ -1363,11 +1365,10 @@ mod tests {
         let me = NodeIdentity::from_seed([81; 32]);
         let ks = Keystore::at(crate::testutil::temp_dir());
         std::fs::write(ks.path(crate::caller::login::ID_TOKEN_FILE), "h.p.s\n").unwrap();
-        let membership = Membership::mint(&root, me.node_id(), 0, i64::MAX).unwrap();
         Fixture {
             creds: Credentials {
                 node: Arc::new(me),
-                membership,
+                root: root.node_id(),
                 relay_override: None,
                 id_token: None,
             },
@@ -1411,7 +1412,7 @@ mod tests {
     }
 
     /// Host A is down, host B answers: the call fails over to B, presents a
-    /// `Hello` with this node's membership, view version and stored token,
+    /// `Hello` with this node's view version and stored token,
     /// notes the newer head B reports (the next `wires services` refreshes),
     /// and remembers B as last-good.
     #[tokio::test]
@@ -1426,7 +1427,7 @@ mod tests {
             out: "42\n",
             policy: Some(v2),
         };
-        let (b_id, b_addr, seen) = fake_host(&f.root, &b, answer).await;
+        let (b_id, b_addr, seen) = fake_host(&b, answer).await;
         let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let hints = Hints::from_pairs([(down, vec![dead]), (b_id, vec![b_addr])]);
 
@@ -1436,9 +1437,8 @@ mod tests {
         {
             let seen = seen.lock().unwrap();
             assert_eq!(seen.len(), 1);
-            assert_eq!(seen[0].membership, f.creds.membership);
             assert_eq!(seen[0].state_version, StateVersion(1));
-            assert_eq!(seen[0].id_token, Some(library::IdToken::new("h.p.s")));
+            assert_eq!(seen[0].id_token, library::IdToken::new("h.p.s"));
         }
         let stored = view::read(&f.ks, f.root.node_id()).unwrap().unwrap();
         assert_eq!(stored.version(), StateVersion(1), "a view isn't a policy");
@@ -1462,12 +1462,12 @@ mod tests {
         let a = NodeIdentity::from_seed([84; 32]);
         let b = NodeIdentity::from_seed([85; 32]);
         let state = held(&f, &signed_state(&f.root, 1, &[a.node_id(), b.node_id()]));
-        let (a_id, a_addr, _) = fake_host(&f.root, &a, Answer::Deny("not in role analyst")).await;
+        let (a_id, a_addr, _) = fake_host(&a, Answer::Deny("not in role analyst")).await;
         let answer = Answer::Run {
             out: "",
             policy: None,
         };
-        let (b_id, b_addr, b_seen) = fake_host(&f.root, &b, answer).await;
+        let (b_id, b_addr, b_seen) = fake_host(&b, answer).await;
         let hints = Hints::from_pairs([(a_id, vec![a_addr]), (b_id, vec![b_addr])]);
         let (r, out) = run_service(&f, &state, hints).await;
         let err = r.unwrap_err();
@@ -1502,7 +1502,11 @@ mod tests {
             .unwrap();
         p.not_after = 1;
         let expired = crate::testutil::signed_policy(&f.root, p);
-        let held = HeldView::fetched(expired.view_for(Some(&me()), None), None, 0);
+        let held = HeldView::fetched(
+            expired.view_for(crate::testutil::any_node(), Some(&me()), None),
+            None,
+            0,
+        );
         let err = format!("{:#}", check_fresh(&held, 10).unwrap_err());
         assert!(
             err.contains("expired") && err.contains("wires policy push"),
@@ -1526,7 +1530,7 @@ mod tests {
             policy: v2,
             got: got.clone(),
         };
-        let (h_id, h_addr, _) = fake_host(&f.root, &h, answer).await;
+        let (h_id, h_addr, _) = fake_host(&h, answer).await;
         let hints = Hints::from_pairs([(h_id, vec![h_addr])]);
         let (r, out) = run_service_with_stdin(&f, &held(&f, &v1), hints, b"secret".to_vec()).await;
         let err = r.unwrap_err();
@@ -1555,7 +1559,7 @@ mod tests {
             policy: forged,
             got: got.clone(),
         };
-        let (h_id, h_addr, _) = fake_host(&f.root, &h, answer).await;
+        let (h_id, h_addr, _) = fake_host(&h, answer).await;
         let hints = Hints::from_pairs([(h_id, vec![h_addr])]);
         let (r, _) = run_service_with_stdin(&f, &held(&f, &v1), hints, b"secret".to_vec()).await;
         let err = format!("{:#}", r.unwrap_err());
@@ -1571,7 +1575,7 @@ mod tests {
             policy: v2,
             got: got.clone(),
         };
-        let (h_id, h_addr, _) = fake_host(&f.root, &h, answer).await;
+        let (h_id, h_addr, _) = fake_host(&h, answer).await;
         let hints = Hints::from_pairs([(h_id, vec![h_addr])]);
         let (r, _) = run_service_with_stdin(&f, &held(&f, &v1), hints, b"secret".to_vec()).await;
         assert_eq!(r.unwrap(), 0);
@@ -1630,7 +1634,7 @@ mod tests {
                 .bind()
                 .await
                 .unwrap();
-            let (h_id, h_addr, _) = fake_host(&f.root, &h, answer).await;
+            let (h_id, h_addr, _) = fake_host(&h, answer).await;
             let dial = ServiceDial {
                 endpoint: &endpoint,
                 hints: Hints::from_pairs([(h_id, vec![h_addr])]),

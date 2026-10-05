@@ -45,8 +45,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::Endpoint;
 use library::{
-    DIRECTORY_SUB_ALPN, Fresh, Membership, NodeId, SignedPolicy, StateVersion, SubFrame,
-    SubRequest, SubscriptionKind,
+    DIRECTORY_SUB_ALPN, Fresh, NodeId, SignedPolicy, StateVersion, SubFrame, SubRequest,
+    SubscriptionKind,
 };
 
 use super::freshness::Freshness;
@@ -90,8 +90,6 @@ pub(crate) struct Follower {
     pub(crate) ks: Arc<Keystore>,
     /// The network root everything verifies under.
     pub(crate) root: NodeId,
-    /// The host's badge, which each subscription opens with.
-    pub(crate) badge: Membership,
     /// Where each `Fresh` goes.
     pub(crate) freshness: Arc<Freshness>,
     /// Whether this host runs the directory mode (decided at start): if not,
@@ -244,10 +242,9 @@ impl Follower {
         have: StateVersion,
     ) -> Result<Ended> {
         let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
-        let hello = SubRequest::Hello {
-            badge: self.badge.clone(),
-            id_token: None,
-        };
+        // A host presents no token: the directory admits it because the
+        // policy names its key.
+        let hello = SubRequest::Hello { id_token: None };
         let subscribe = SubRequest::Subscribe {
             kind: SubscriptionKind::Policy,
             have,

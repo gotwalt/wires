@@ -5,7 +5,7 @@
 //! A view is the root-signed head (for its version, lifetime and the
 //! directories whose [`Fresh`](crate::Fresh) vouches for it) and the signed
 //! entries of the services a role in whose `allow` admits the caller. Each
-//! entry verifies on its own under the root, as a badge does, so a directory can't
+//! entry verifies on its own under the root, so a directory can't
 //! forge one, move one from another fabric, or hand back an older version
 //! than one the caller holds ([`View::apply`] keeps the newest version of
 //! each entry). What a view leaves out is the point: no role, no ban, and no
@@ -40,16 +40,17 @@
 //!     issuer: "https://idp".into(), subject: "1".into(),
 //!     email: None, org: None, groups: vec![], not_after: 0,
 //! };
-//! let view = v1.view_for(Some(&alice), None);
+//! let laptop = NodeIdentity::from_seed([2u8; 32]).node_id();
+//! let view = v1.view_for(laptop, Some(&alice), None);
 //!
 //! // The admin adds a service: the update carries just that entry.
 //! policy.version = StateVersion(2);
 //! policy.services.insert(ServiceName::new("orders-db").unwrap(), service("orders"));
 //! let v2 = policy.sign_after(&root, &v1).unwrap();
-//! let update = view.update_to(&v2.view_for(Some(&alice), None));
+//! let update = view.update_to(&v2.view_for(laptop, Some(&alice), None));
 //! assert_eq!(update.changed.len(), 1);
 //! let view = view.apply(&update, root.node_id()).unwrap();
-//! assert_eq!(view, v2.view_for(Some(&alice), None));
+//! assert_eq!(view, v2.view_for(laptop, Some(&alice), None));
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -224,7 +225,7 @@ mod tests {
 
     #[test]
     fn a_view_entry_verifies_alone() {
-        let view = signed().view_for(Some(&who("carol@example.com")), None);
+        let view = signed().view_for(node(2), Some(&who("carol@example.com")), None);
         view.verify(r()).unwrap();
         for e in &view.entries {
             e.verify(r()).unwrap();
@@ -237,7 +238,7 @@ mod tests {
 
     #[test]
     fn forged_foreign_and_misplaced_entries_are_refused() {
-        let good = signed().view_for(Some(&who("carol@example.com")), None);
+        let good = signed().view_for(node(2), Some(&who("carol@example.com")), None);
 
         // A forged entry: its signature no longer covers it.
         let mut t = good.clone();
@@ -275,7 +276,7 @@ mod tests {
         p.services.get_mut(&name("status")).unwrap().description =
             "Uptime of the ORDERS stack".into();
         let s = p.sign(&root()).unwrap();
-        let view = s.view_for(Some(&who("alice@example.com")), None);
+        let view = s.view_for(node(2), Some(&who("alice@example.com")), None);
         let names = |q| -> Vec<String> {
             view.matching(q)
                 .iter()
@@ -291,11 +292,11 @@ mod tests {
     #[test]
     fn views_update_on_grants_and_revocations() {
         let alice = who("alice@example.com");
-        let old = signed().view_for(Some(&alice), None);
+        let old = signed().view_for(node(2), Some(&alice), None);
 
         // An unrelated edit: just the new head.
         let new = v4(|p| p.services.get_mut(&name("deploy")).unwrap().description = "x".into());
-        let update = old.update_to(&new.view_for(Some(&alice), None));
+        let update = old.update_to(&new.view_for(node(2), Some(&alice), None));
         assert!(update.changed.is_empty() && update.removed.is_empty());
         assert_eq!(old.apply(&update, r()).unwrap().head, new.head);
 
@@ -307,10 +308,10 @@ mod tests {
                 .unwrap()
                 .push(email("alice@example.com"));
         });
-        let update = old.update_to(&new.view_for(Some(&alice), None));
+        let update = old.update_to(&new.view_for(node(2), Some(&alice), None));
         assert_eq!(update.changed.len(), 1, "{:?}", update.changed);
         let applied = old.apply(&update, r()).unwrap();
-        assert_eq!(applied, new.view_for(Some(&alice), None));
+        assert_eq!(applied, new.view_for(node(2), Some(&alice), None));
         assert!(applied.entry(&name("locked")).is_some());
         assert_eq!(
             applied.entry(&name("orders-db")).unwrap().version,
@@ -322,7 +323,7 @@ mod tests {
         let new = v4(|p| {
             p.services.get_mut(&name("status")).unwrap().allow = vec![role("oncall")];
         });
-        let update = old.update_to(&new.view_for(Some(&alice), None));
+        let update = old.update_to(&new.view_for(node(2), Some(&alice), None));
         assert_eq!(update.removed, vec![name("status")]);
         let applied = old.apply(&update, r()).unwrap();
         assert!(applied.entry(&name("status")).is_none());
@@ -331,9 +332,9 @@ mod tests {
     #[test]
     fn a_bad_view_update_is_refused() {
         let alice = who("alice@example.com");
-        let old = signed().view_for(Some(&alice), None);
+        let old = signed().view_for(node(2), Some(&alice), None);
         let new = v4(|p| p.services.get_mut(&name("status")).unwrap().description = "new".into());
-        let good = old.update_to(&new.view_for(Some(&alice), None));
+        let good = old.update_to(&new.view_for(node(2), Some(&alice), None));
         assert_eq!(good.changed.len(), 1);
         let held = old.apply(&good, r()).unwrap();
 
@@ -344,7 +345,7 @@ mod tests {
             p.services.get_mut(&name("status")).unwrap().description = "new".into();
             p.sign_after(&root(), &new).unwrap()
         };
-        let mut t = held.update_to(&newer.view_for(Some(&alice), None));
+        let mut t = held.update_to(&newer.view_for(node(2), Some(&alice), None));
         t.changed.push(old.entry(&name("status")).unwrap().clone());
         assert!(matches!(held.apply(&t, r()), Err(Error::InvalidPolicy(_))));
 
@@ -382,8 +383,8 @@ mod tests {
             b.version = StateVersion(a.version.0 + 1);
             let new = b.sign_after(&root(), &old).unwrap();
 
-            let from = old.view_for(principal.as_ref(), None);
-            let to = new.view_for(principal.as_ref(), None);
+            let from = old.view_for(node(2), principal.as_ref(), None);
+            let to = new.view_for(node(2), principal.as_ref(), None);
             let update = from.update_to(&to);
             let applied = from.apply(&update, r()).unwrap();
             prop_assert!(applied.verify(r()).is_ok());

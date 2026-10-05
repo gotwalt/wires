@@ -4,7 +4,7 @@
 //! An embedded host is `wires serve` running inside the app. It starts the
 //! same way, writes the same log line per call, and decides every call by the same
 //! admin-signed policy. It must be a joined node (`WIRES_HOME=<dir> wires
-//! id`, the admin invites it, `WIRES_HOME=<dir> wires join <token>`), and
+//! join <network>`, with the string the admin prints with `wires network`), and
 //! the signed policy must assign each of its services to it
 //! (`wires service add <name> --host <it>`), or [`Host::serve`] refuses to
 //! start, naming the first that isn't.
@@ -66,9 +66,9 @@ pub struct HostBuilder {
 
 impl Host {
     /// Start building a host whose keystore is `home` (what `$WIRES_HOME` is
-    /// for `wires`): its `node.seed`, `membership.json`, signed policy, call
-    /// log and address hints. The host reads nothing from `$WIRES_HOME`,
-    /// `$WIRES_NODE_SEED` or `$WIRES_MEMBERSHIP`.
+    /// for `wires`): its `node.seed`, `network.json` (`wires join <network>`
+    /// there), signed policy and address hints. The host reads nothing from
+    /// `$WIRES_HOME` or `$WIRES_NODE_SEED`.
     pub fn builder(home: impl Into<PathBuf>) -> HostBuilder {
         HostBuilder {
             home: home.into(),
@@ -180,8 +180,8 @@ impl HostBuilder {
         self
     }
 
-    /// Check the configuration and load the keystore: the node key, the
-    /// membership. Errors on a bad service name, a name registered twice
+    /// Check the configuration and load the keystore: the node key, and the
+    /// network it joined (its root key). Errors on a bad service name, a name registered twice
     /// (natively, or natively and in `host.json`), no services at all, an
     /// invalid `host.json`, or a keystore that isn't a joined node's. Whether the signed policy assigns the services here
     /// is checked when the host starts to serve.
@@ -227,23 +227,27 @@ impl HostBuilder {
         let keystore = Keystore::at(&self.home);
         let node = keystore.read_node_identity()?.ok_or_else(|| {
             anyhow!(
-                "no node key in {}: run `WIRES_HOME={} wires id`, have the admin invite it, \
-                 then `wires join` there",
+                "no node key in {}: run `WIRES_HOME={} wires join <network>` with the string \
+                 your admin prints with `wires network`",
                 self.home.display(),
                 self.home.display()
             )
         })?;
-        let membership = keystore.read_membership()?.ok_or_else(|| {
-            anyhow!(
-                "{} holds a node key but no membership: `WIRES_HOME={} wires join <token>`",
-                self.home.display(),
-                self.home.display()
-            )
-        })?;
+        let root = keystore
+            .read_network()?
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} holds a node key but joined no network: `WIRES_HOME={} wires join \
+                     <network>`",
+                    self.home.display(),
+                    self.home.display()
+                )
+            })?
+            .root;
         Ok(Host {
             serving: Serving {
                 node,
-                membership,
+                root,
                 keystore: Arc::new(keystore),
                 config,
                 native,
@@ -269,15 +273,14 @@ mod tests {
         }
     }
 
-    /// A keystore holding a node key and a membership for it.
+    /// A keystore holding a node key and a network string.
     fn joined() -> PathBuf {
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
         let root = library::NodeIdentity::from_seed([1u8; 32]);
         let node = library::NodeIdentity::from_seed([9u8; 32]);
         ks.save_node(&node).unwrap();
-        ks.save_membership(&library::Membership::mint(&root, node.node_id(), 0, i64::MAX).unwrap())
-            .unwrap();
+        crate::testutil::join(&ks, &root, &[]);
         home
     }
 
@@ -309,7 +312,7 @@ mod tests {
     #[test]
     fn an_unjoined_keystore_says_what_to_run() {
         let empty = crate::testutil::temp_dir();
-        assert!(err(Host::builder(&empty).service("t", Nop)).contains("wires id"));
+        assert!(err(Host::builder(&empty).service("t", Nop)).contains("wires join <network>"));
         Keystore::at(&empty)
             .save_node(&library::NodeIdentity::generate())
             .unwrap();

@@ -1,13 +1,12 @@
-Install the invite token your admin sent (without one, print this node's id)
+Join a network with its string, signing nobody in (a host or directory)
 
-Usage: wires join [TOKEN]
+Usage: wires join <NETWORK>
 
 Arguments:
-  [TOKEN]  The token your admin sent (`wires invite` printed it)
+  <NETWORK>  The network string your admin prints with `wires network`
 
 Options:
   -h, --help  Print help
 
-Examples:
-  wires id                    # send the id to your admin; they send a token
-  wires join <token>          # then: wires login
+Example:
+  wires join <network>        # on a host or directory; then: wires serve host.json

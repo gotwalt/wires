@@ -1,4 +1,4 @@
-//! A caller's `view` subscription on `wires/directory-sub/1` (card 37).
+//! A caller's `view` subscription on `wires/directory-sub/2` (card 37).
 //!
 //! A long-running caller (`wires mcp`, one gateway session, `wires inbox
 //! --wait`) follows its view instead of asking again: the directory sends
@@ -10,40 +10,37 @@
 //!
 //! The principal is the ID token the subscriber presented in its `hello`,
 //! verified once, when the subscription opens, as a `view` request is
-//! ([`Directory::principal`]); a subscriber that signs in again subscribes
-//! again. The first frame is always the whole view, whatever `have` the
+//! ([`Directory::admit`]): a subscriber with no token that verifies is
+//! refused at the `hello`. One that signs in again subscribes again. The first frame is always the whole view, whatever `have` the
 //! subscriber names: the directory stores nothing per subscriber, so it
 //! can't know which view a `have` refers to. A subscriber that can't apply
 //! an update subscribes again.
 //!
-//! Every head is checked as the `hello` was: a head that bans the
-//! subscriber (or a badge that has lapsed) ends the stream with `denied`
-//! (`not a member of this network`), and so does a head that stops listing
-//! this directory (it can no longer vouch), so the caller fails over.
+//! Every view is cut under the newest head, bans included: a head that bans
+//! the subscriber's node or person sends a `view_update` that empties its
+//! view. A head that stops listing this directory (it can no longer vouch)
+//! ends the stream with `denied`, so the caller fails over.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, SendStream};
-use library::{IdToken, Membership, NodeId, Principal, SubFrame, View};
+use library::{NodeId, Principal, SubFrame, View};
 
-use super::node::{Directory, NOT_ADMITTED};
+use super::node::Directory;
 use super::wire;
-use crate::clock::now_unix;
 use crate::host::transport;
 
-/// Serve one `view` subscription for the admitted `caller` (which presented
-/// `badge` and `id_token` in its `hello`) on `send`, until the caller goes
-/// or the directory stops; or with a terminal `denied` when the subscriber
-/// cap is reached, a new head no longer admits the caller (`badge` checked
-/// again, and its bans), or the head stops listing this directory.
+/// Serve one `view` subscription for `caller`, verified as `principal` by
+/// the token in its `hello`, on `send`, until the caller goes or the
+/// directory stops; or with a terminal `denied` when the subscriber cap is
+/// reached, or the head stops listing this directory.
 pub(crate) async fn serve(
     dir: &Directory,
     conn: &Connection,
     send: &mut SendStream,
     caller: NodeId,
-    badge: &Membership,
-    id_token: Option<&IdToken>,
+    principal: Principal,
 ) -> Result<()> {
     let Ok(_slot) = Arc::clone(&dir.subscribers).try_acquire_owned() else {
         return deny(
@@ -55,16 +52,12 @@ pub(crate) async fn serve(
         )
         .await;
     };
-    let principal: Option<Principal> = match dir.snapshot() {
-        Some(c) => {
-            dir.principal(caller, id_token, &c.held.policy, now_unix())
-                .await
-        }
-        None => return deny(send, "this directory holds no policy yet".into()).await,
-    };
+    if dir.snapshot().is_none() {
+        return deny(send, super::node::EMPTY.into()).await;
+    }
     tracing::debug!(
         peer = %caller.hex(),
-        who = principal.as_ref().map(Principal::name).as_deref().unwrap_or("-"),
+        who = %principal.name(),
         "directory: a view subscription"
     );
     let mut sent: Option<View> = None;
@@ -76,16 +69,12 @@ pub(crate) async fn serve(
                 // The head no longer lists this node: it vouches for nothing.
                 return deny(send, "no longer a directory of this network".into()).await;
             };
-            if let Err(detail) = dir.admit(caller, badge, now_unix()) {
-                tracing::info!(peer = %caller.hex(), "view subscription ended: {detail}");
-                return deny(send, NOT_ADMITTED.into()).await;
-            }
             let frame = match &sent {
                 Some(view) if view.head.head.version >= c.held.version() => {
                     SubFrame::Fresh { fresh }
                 }
                 held => {
-                    let view = c.held.signed.view_for(principal.as_ref(), None);
+                    let view = c.held.signed.view_for(caller, Some(&principal), None);
                     let frame = match held {
                         Some(before) => SubFrame::ViewUpdate {
                             update: before.update_to(&view),

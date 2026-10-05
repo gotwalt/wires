@@ -8,9 +8,10 @@
 //! items) and the caller's verified [`Principal`]; there
 //! is no network and no clock (the principal handed in is already fresh).
 //!
-//! Neither checks the caller's badge: that is the gate's, before this
-//! ([`check_admitted`](crate::check_admitted)). Both do refuse a node the
-//! policy bans, so a registry decision never admits a removed node.
+//! Neither verifies the caller's ID token: that is the gate's, before this,
+//! and so is admission ([`check_admitted`](crate::check_admitted)). Both do
+//! refuse a node or a person the policy bans, so a registry decision never
+//! admits a removed caller.
 //!
 //! The host is the ground truth: [`allowed_services`] is defined in terms of
 //! [`authorize`], so the listing never shows a service the host would refuse
@@ -38,7 +39,7 @@ pub struct Grant {
 /// and what the host's log line says, so each case is precise.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// The policy bans the caller: the admin removed it.
+    /// The policy bans the caller's node or person: the admin removed it.
     Banned,
     /// No service by that name is registered.
     UnknownService(ServiceName),
@@ -92,7 +93,8 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// Decide one call against the registry, in order: `caller` is not banned →
+/// Decide one call against the registry, in order: neither `caller` nor the
+/// person `principal` is banned →
 /// `service` exists → the first role in its `allow` that admits the caller
 /// (a defined role whose matchers match its verified `principal`; with no
 /// principal, no role admits) → `Ok(role)`. The first failure is the
@@ -129,7 +131,7 @@ impl fmt::Display for Refusal {
 ///     Err(Refusal::NotInRole { principal: None, .. })
 /// ));
 /// let removed = NodeIdentity::from_seed([9u8; 32]).node_id();
-/// policy.ban(removed, i64::MAX);
+/// policy.ban(removed);
 /// assert_eq!(authorize(&policy, removed, Some(&alice), &status), Err(Refusal::Banned));
 /// ```
 pub fn authorize(
@@ -138,7 +140,7 @@ pub fn authorize(
     principal: Option<&Principal>,
     service: &ServiceName,
 ) -> Result<RoleName, Refusal> {
-    if policy.bans_node(caller) {
+    if policy.bans_node(caller) || principal.is_some_and(|p| policy.bans_person(p)) {
         return Err(Refusal::Banned);
     }
     let Some(svc) = policy.services.get(service) else {
@@ -171,7 +173,7 @@ pub fn role_admits(policy: &Policy, role: &RoleName, principal: Option<&Principa
 
 /// Every service [`authorize`] would admit `caller` to, with the admitting
 /// role, in name order. Services it can't call are left out, not listed as
-/// refused. A banned node gets nothing.
+/// refused. A banned node or person gets nothing.
 pub fn allowed_services(
     policy: &Policy,
     caller: NodeId,
@@ -226,12 +228,16 @@ mod tests {
 
     /// alice (2), bob (3) call; host (4) serves `orders-db` (analyst:
     /// alice at [`ISS`]) and `status` (staff: anyone [`ISS`] verified);
-    /// `locked` allows nobody; 9 is banned.
+    /// `locked` allows nobody; node 9 and mallory are banned.
     fn policy() -> Policy {
         let mut s = Policy::new(node(1));
         s.version = StateVersion(1);
         s.not_after = i64::MAX;
-        s.ban(node(9), i64::MAX);
+        s.ban(node(9));
+        s.ban_person(crate::item::Person::new(
+            crate::idp::Issuer::new(ISS),
+            "mallory@example.com",
+        ));
         let analyst = RoleName::new("analyst").unwrap();
         s.roles.insert(
             analyst.clone(),
@@ -267,6 +273,11 @@ mod tests {
         let bob = who("bob@example.com");
         assert_eq!(
             authorize(&s, node(9), Some(&bob), &name("status")),
+            Err(Refusal::Banned)
+        );
+        let mallory = who("mallory@example.com");
+        assert_eq!(
+            authorize(&s, node(3), Some(&mallory), &name("status")),
             Err(Refusal::Banned)
         );
         assert_eq!(

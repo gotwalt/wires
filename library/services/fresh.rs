@@ -193,7 +193,7 @@ impl Fresh {
 mod tests {
     use super::*;
     use crate::head::ItemsHash;
-    use crate::head::{POLICY_V3, PolicyHead};
+    use crate::head::{POLICY_V4, PolicyHead};
     use proptest::prelude::*;
 
     fn root() -> NodeIdentity {
@@ -206,7 +206,7 @@ mod tests {
 
     fn head_with(version: u64, items: u8, directories: Vec<NodeId>) -> SignedPolicyHead {
         PolicyHead {
-            format: POLICY_V3,
+            format: POLICY_V4,
             fabric: root().node_id(),
             version: StateVersion(version),
             issued: 0,

@@ -11,4 +11,4 @@ Options:
   -h, --help  Print help
 
 Example:
-  wires role set analyst --issuer https://accounts.google.com '*@example.com'
+  wires role set analyst '*@example.com'

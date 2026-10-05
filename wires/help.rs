@@ -26,9 +26,13 @@ sign-in against an admin-signed list of who may call what. A refusal
 (\"denied by host\", exit 77) is that policy, not a fault: don't retry or work
 around it; ask your admin for access.";
 
-/// What a command that needs a membership says on a node that has none.
-pub(crate) const NOT_JOINED: &str = "this node has not joined a network: run `wires id`, send the \
-id to your admin, then `wires join <token>` with the token they send";
+/// What a command that needs a network says on a node that joined none.
+pub(crate) const NOT_JOINED: &str = "this node has not joined a network: run `wires login \
+<network>` (a caller) or `wires join <network>` (a host or directory) with the string your \
+admin prints with `wires network`";
+
+/// What a command that needs a sign-in says on a node with no ID token.
+pub(crate) const NOT_SIGNED_IN: &str = "not signed in: run `wires login`";
 
 /// The caller's two commands, after [`PREMISE`] wherever a CLI is the way in
 /// (`wires --help`, an empty `wires services`).
@@ -45,9 +49,7 @@ pub(crate) const HELP_TEMPLATE: &str = "\
 
   services  List the services you may call (a word searches them; --json)
   call      Run a service by name; its output and exit code are yours
-  login     Sign in with your IdP; every call needs it
-  join      Install the invite token your admin sent
-  id        Print this node's id, to send your admin for an invite
+  login     Sign in with your IdP (the first time: login <network>)
   inbox     Print the messages hosts pushed to you
   mcp       Serve the services you may call as MCP tools over stdio
 
@@ -61,27 +63,28 @@ Admin, host and directory commands: wires --help-all";
 pub(crate) const HELP_ALL_TEMPLATE: &str = "\
 {before-help}Usage: wires <COMMAND>
 
-Caller: runs services by name (every node joins the same way)
+Caller: runs services by name, signed in with your IdP
   services  List the services you may call (a word searches them; --json)
   call      Run a service by name; its output and exit code are yours
-  login     Sign in with your IdP; every call needs it
-  join      Install the invite token your admin sent
-  id        Print this node's id, to send your admin for an invite
+  login     Sign in with your IdP (the first time: login <network>)
   inbox     Print the messages hosts pushed to you
   mcp       Serve the services you may call as MCP tools over stdio
   gateway   Serve them as a remote MCP server (HTTP + OAuth) for web clients
+  id        Print this node's id (the admin names hosts and directories by it)
+  network   Print the network string every node joins with
 
-Admin: admits nodes and signs what runs where (holds the root key)
+Admin: signs who may call what, and where it runs (holds the root key)
   init      Create the network: the root key, this node, the first policy
-  invite    Admit a node: print the join token for its id
-  remove    Ban a node; hosts refuse its next call
+  remove    Remove a person (email) or a node; hosts refuse them
+  restore   Lift a removal
   service   Register services: add, set, rm (who may call, which hosts)
   role      Define roles from IdP identities: set, rm
   issuer    Trust an IdP: set, rm
   directory Name the network's directories: add, rm; or run one: serve
   policy    Re-publish the signed policy (push) or change its settings
 
-Host: implements the services assigned to it
+Host and directory: implement the services, hold the policy
+  join      Join with the network string, signing nobody in
   serve     Run host.json's services; check every caller
   push      Send a caller a message by its node id or role, to its inbox
 
@@ -110,19 +113,24 @@ nothing on stdout when none. --json, one object per line:
 /// `wires login`: examples.
 pub(crate) const LOGIN_AFTER: &str = "\
 Examples:
-  wires login
+  wires login <network>       # the first time: join and sign in
+  wires login                 # again, when your sign-in expires
   wires login --no-browser    # prints the URL to open elsewhere";
 
 /// `wires join`: examples.
 pub(crate) const JOIN_AFTER: &str = "\
-Examples:
-  wires id                    # send the id to your admin; they send a token
-  wires join <token>          # then: wires login";
+Example:
+  wires join <network>        # on a host or directory; then: wires serve host.json";
 
 /// `wires id`: examples.
 pub(crate) const ID_AFTER: &str = "\
 Example:
-  wires id                    # send this to your admin: `wires invite <id>`";
+  wires id                    # the admin names this node: `wires directory add wb=<id>`";
+
+/// `wires network`: examples.
+pub(crate) const NETWORK_AFTER: &str = "\
+Example:
+  wires network               # one string, for every node; not secret";
 
 /// `wires inbox`: examples and exit codes.
 pub(crate) const INBOX_AFTER: &str = "\
@@ -148,27 +156,28 @@ pub(crate) const INIT_AFTER: &str = "\
 Example:
   wires init --client-id <desktop client id> --public-client-secret <its secret>";
 
-/// `wires invite`: examples.
-pub(crate) const INVITE_AFTER: &str = "\
-Example:
-  wires invite <node id> --name alice    # prints the token; send it to them";
-
 /// `wires remove`: examples.
 pub(crate) const REMOVE_AFTER: &str = "\
+Examples:
+  wires remove alice@example.com        # a person, from every machine
+  wires remove workbench                # a node, by label or id";
+
+/// `wires restore`: examples.
+pub(crate) const RESTORE_AFTER: &str = "\
 Example:
-  wires remove alice";
+  wires restore alice@example.com";
 
 /// `wires service`: examples.
 pub(crate) const SERVICE_AFTER: &str = "\
 Examples:
   wires service add orders-db --description \"Read-only SQL over the orders database\" \\
-    --allow analyst --host workbench
+    --allow analyst --host workbench=<node id>
   wires service rm orders-db";
 
 /// `wires role`: examples.
 pub(crate) const ROLE_AFTER: &str = "\
 Example:
-  wires role set analyst --issuer https://accounts.google.com '*@example.com'";
+  wires role set analyst '*@example.com'";
 
 /// `wires issuer`: examples.
 pub(crate) const ISSUER_AFTER: &str = "\
@@ -178,7 +187,7 @@ Example:
 /// `wires directory`: examples.
 pub(crate) const DIRECTORY_AFTER: &str = "\
 Examples:
-  wires directory add workbench
+  wires directory add workbench=<node id>
   wires directory serve";
 
 /// `wires policy`: examples.
