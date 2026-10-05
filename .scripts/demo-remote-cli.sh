@@ -13,9 +13,10 @@
 #                Two hosts implement it: a caller never names either. Both
 #                are also the network's directories (`wires directory add`):
 #                `serve` runs the directory too, which holds the signed
-#                policy the admin publishes; each host follows the other's
-#                (a subscription: every edit arrives within a second), and
-#                callers fetch from them. Both start empty, holding no
+#                policy the admin publishes; each directory follows the
+#                other (a replica subscription: an edit either one takes
+#                reaches the other within a second), and callers fetch their
+#                views from them. Both start empty, holding no
 #                policy, and take the admin's first `wires policy push`.
 #                Two, because step 7 stops the workbench and step 8's
 #                `wires remove` must still reach a directory.
@@ -47,9 +48,10 @@
 #
 # Asserted: before it signs in the agent is in no network, so it lists
 # nothing and dials nothing (exit 1, "run `wires login <network>`"); after
-# `wires login <network>` `wires services` lists orders-db (analyst);
-# the signed-in non-analyst sees nothing to call, and naming it anyway stops
-# on its own machine (exit 1, no host dialed); an analyst the hosts'
+# `wires login <network>` `wires services` lists orders-db (analyst); a
+# person the IdP signs in but no role matches is told at sign-in that she is
+# not in the network, and `wires services` and `wires call` both exit 1 on
+# her own machine with that sentence (no host dialed); an analyst the hosts'
 # `also_require` leaves out is refused by the host (exit 77, 0 bytes out); the
 # agent's SQL runs (args, stdin, MCP); `.shell id` is refused by sqlite3
 # -safe; the workbench pushes to the agent by key and `wires inbox` fetches it
@@ -181,7 +183,7 @@ say "  agent      your agent's machine ($EMAIL)"
 say "  observer   $OUTSIDER: the IdP knows her; no role in the network names her"
 say "  bob        $BOB: an analyst, but not on call"
 say "  root       the human who signs who may call what, and where it runs"
-say "and a stand-in IdP at $ISSUER (card 08 swaps in Google)."
+say "and a stand-in IdP at $ISSUER (on a real network: Google)."
 beat 5
 
 # ==========================================================================
@@ -483,7 +485,7 @@ ok "5: exit $rc from sqlite3 itself"
 beat 3
 
 # ==========================================================================
-step "6  the workbench pushes to the agent -- by key; the agent exposes nothing"
+step "6  the workbench pushes to the agent -- by key; the agent publishes no URL"
 # ==========================================================================
 run "wires inbox --wait --timeout 1s   # nothing yet"
 set +e
@@ -580,7 +582,7 @@ set -e
 	bad "8: the removed agent's call exited $rc, expected $EXIT_DENIED"
 }
 [ "$(wc -c <"$D/c5.out" | tr -d ' ')" -eq 0 ] || bad "8: the refused call wrote $(wc -c <"$D/c5.out") bytes to stdout"
-grep -qF "not admitted to this network" "$D/c5.err" || {
+grep -qF "not admitted to this network: no role in this network matches $EMAIL, or you were removed" "$D/c5.err" || {
 	cat "$D/c5.err" >&2
 	bad "8: refused, but not for the removal"
 }

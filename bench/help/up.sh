@@ -6,7 +6,9 @@
 #                `analyst` (*@example.com) and `hr` (hr@example.com), the
 #                workbench named by key as the directory and the host of five
 #                services, `wires network`, then `wires policy push`
-#   workbench -- `wires serve host.json` (also the network's directory),
+#   workbench -- `wires join <network>`, `wires serve host.json` (also the
+#                network's directory, which starts empty and takes the first
+#                publish),
 #                implementing orders-db (sqlite3), deploy-status, ci-logs,
 #                tickets and payroll; payroll also requires role `hr` on this
 #                host (`also_require`), so the agent's call is refused (77)

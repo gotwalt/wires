@@ -24,11 +24,12 @@
 # generated from the Rust; alice's set (value on stdin), get and keys
 # round-trip through the handler, state kept between calls; the handler's
 # exit code and stderr are the caller's, and an exception it raises is exit
-# 1 with its message; the handler's call.id_token() is the ID token alice
-# presented; bob, whose view holds no kv, dials nothing (exit 1);
-# push_to_caller reaches alice's `wires inbox` from the host's verified key;
-# and SIGTERM makes the example call `stop()`, so
-# `serve()` returns and the process exits 0 on its own.
+# 1 with its message; the handler's call.id_token() (TypeScript:
+# call.idToken()) is the ID token alice presented; bob, whom no role
+# matches, holds no view and dials nothing (exit 1, told he is not in the
+# network); push_to_caller reaches alice's `wires inbox` from the host's
+# verified key; and SIGTERM makes the example call `stop()`, so `serve()`
+# returns and the process exits 0 on its own.
 #
 # Python comes from uv (a uv-managed CPython, $WIRES_PYTHON, default 3.13;
 # uv downloads it on first use); TypeScript runs on Node >= 22.18, which
@@ -124,6 +125,7 @@ if [ "$LANG_" = python ]; then
 	PYTHON_VERSION="${WIRES_PYTHON:-3.13}"
 	PY="$(.scripts/build-python.sh "$D/python")"
 	LANG_NAME=Python
+	ID_TOKEN_FN="call.id_token()"
 else
 	command -v node >/dev/null || bad "node is not on PATH"
 	# The package, installed as `wires` beside a copy of the example.
@@ -137,6 +139,7 @@ else
 		bad "kv.mts does not typecheck against the generated index.d.ts"
 	}
 	LANG_NAME=TypeScript
+	ID_TOKEN_FN="call.idToken()"
 	ok "kv.mts typechecks against the index.d.ts generated from bindings/node/lib.rs"
 fi
 
@@ -208,7 +211,7 @@ ok "the $LANG_NAME host serves kv as ${HOST_ID:0:8}... (pid $HOST_PID)"
 # Each caller's whole onboarding: `wires login <network>`.
 login_as "$agent" "$EMAIL" "$NETWORK"
 login_as "$other" "$OTHER" "$NETWORK"
-ok "the $LANG_NAME host serves the admin's signed policy; alice and bob signed in"
+ok "the $LANG_NAME host serves the admin's signed policy; alice and bob signed in at the IdP"
 
 # --------------------------------------------------------------------------
 # Calls.
@@ -234,7 +237,7 @@ set -e
 grep -qF "kv: no such key" "$D/c3.err" || bad "the handler's stderr did not reach the caller"
 ok "the handler's exit code (1) and stderr are the caller's"
 
-# The handler holds alice's ID token (`call.id_token()`), the one her
+# The handler holds alice's ID token ($ID_TOKEN_FN), the one her
 # `wires call` presented; `whoami` echoes it without its signature.
 call "$agent" whoami >"$D/c6.out" 2>"$D/c6.err" || {
 	dump "$D/c6.err"
@@ -244,9 +247,9 @@ TOKEN="$(cat "$agent/idp-token.jwt")"
 [ "$(sed -n 1p "$D/c6.out")" = "$EMAIL" ] || bad "whoami did not name alice"
 [ "$(sed -n 2p "$D/c6.out")" = "${TOKEN%.*}" ] || {
 	dump "$D/c6.out"
-	bad "the handler's call.id_token() is not the token alice presented"
+	bad "the handler's $ID_TOKEN_FN is not the token alice presented"
 }
-ok "the $LANG_NAME handler holds alice's ID token (call.id_token()) and her verified email"
+ok "the $LANG_NAME handler holds alice's ID token ($ID_TOKEN_FN) and her verified email"
 
 set +e
 call "$agent" throw >"$D/c5.out" 2>"$D/c5.err"

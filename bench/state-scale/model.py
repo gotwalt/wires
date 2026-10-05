@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# NOTE (card 43, 2026-10-05): this models the design as it stood after cards
+# 35-37: nodes admitted by root-signed 30-day badges handed out in invites,
+# and bans that lapse when the badge would expire. Cards 41 and 47 removed
+# that: a node is admitted by its IdP sign-in and a role that matches it,
+# onboarding is the one network string (no invite, so no `caller_invite`
+# bytes), and a ban (of a node or a person) lasts until `wires restore`. The
+# model no longer matches the code; it is kept, unchanged, as the record
+# behind bench/state-scale/REPORT.md.
 """How much signed-state metadata moves to each node, per day, at four org sizes.
 
 Three designs:

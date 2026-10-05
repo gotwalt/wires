@@ -1,7 +1,7 @@
 /**
  * kv: a wires-native service written in TypeScript.
  *
- * The same store as the Rust and Python examples (wires/examples/kv.rs,
+ * The same store as the Rust and Python examples (wires/examples/kv/,
  * bindings/python/examples/kv.py): a key-value map held in this process's
  * memory, one namespace per verified person, so each caller sees only their
  * own keys.
@@ -13,12 +13,13 @@
  *     wires call kv -- throw                      # throws: exit 1, its message on stderr
  *
  * Run it (Node >= 22.18 runs TypeScript directly) with the package from
- * `./.scripts/build-node.sh` installed as `wires`:
+ * `./.scripts/build-node.sh` installed as `wires`, from the keystore of a
+ * node that ran `wires join <network>` (the admin names it as kv's host):
  *
  *     node kv.mts <WIRES_HOME> <issuer> <audience> [--push-to ROLE] [--loopback]
  *
  * With --push-to, a `set` also pushes "kv: <key> set" to the caller's
- * `wires inbox` (members of ROLE may receive pushes). With --loopback, the
+ * `wires inbox` (people in ROLE may receive pushes). With --loopback, the
  * host takes direct connections only from this machine (others come through
  * its relay), so the macOS firewall doesn't prompt for Node.
  *

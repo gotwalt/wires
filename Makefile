@@ -1,7 +1,7 @@
 # Dev loop over plain Cargo. `make help` lists the targets.
 SH := $(shell git ls-files '*.sh' .githooks/pre-commit)
 
-.PHONY: help build install test lint fmt fmt-check demo python node demo-python demo-node image hooks
+.PHONY: help build install test lint fmt fmt-check demo demo-push python node demo-python demo-node image hooks
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -23,6 +23,8 @@ fmt-check: ## Fail if anything is unformatted
 	shfmt -d $(SH)
 demo: ## Run the self-asserting loopback demo
 	.scripts/demo-remote-cli.sh --quiet
+demo-push: ## Run the self-asserting push demo (a host messages its caller back)
+	.scripts/demo-push.sh --quiet
 python: ## Build the Python bindings into target/python (card 33)
 	.scripts/build-python.sh
 node: ## Build the Node/TypeScript package into target/node/wires (card 33)
