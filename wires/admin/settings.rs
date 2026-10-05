@@ -100,7 +100,9 @@ pub(crate) fn line(settings: &Settings) -> String {
 /// beat, or freshness shorter than the beat).
 pub(crate) fn settings_in(ks: &Keystore, a: &SettingsArgs) -> Result<String> {
     if !a.is_edit() {
-        let root = store::fabric(ks)?.ok_or_else(|| anyhow!("this keystore is in no network"))?;
+        let root = ks
+            .network_root()?
+            .ok_or_else(|| anyhow!("this keystore is in no network"))?;
         let held = store::require_policy(ks, root)?;
         return Ok(format!(
             "{} (policy version {})",
@@ -134,7 +136,7 @@ mod tests {
     #[test]
     fn no_flag_prints_and_edits_nothing() {
         let ks = admin();
-        let before = store::read(&ks, store::fabric(&ks).unwrap().unwrap())
+        let before = store::read(&ks, ks.network_root().unwrap().unwrap())
             .unwrap()
             .unwrap()
             .version();
@@ -143,7 +145,7 @@ mod tests {
             out.starts_with("freshness lenient; beat 300 s; fresh 900 s"),
             "{out}"
         );
-        let after = store::read(&ks, store::fabric(&ks).unwrap().unwrap())
+        let after = store::read(&ks, ks.network_root().unwrap().unwrap())
             .unwrap()
             .unwrap()
             .version();
@@ -172,7 +174,7 @@ mod tests {
             out.contains("freshness strict; beat 60 s; fresh 180 s"),
             "{out}"
         );
-        let held = store::read(&ks, store::fabric(&ks).unwrap().unwrap())
+        let held = store::read(&ks, ks.network_root().unwrap().unwrap())
             .unwrap()
             .unwrap();
         assert_eq!(held.policy.settings.freshness, FreshnessMode::Strict);

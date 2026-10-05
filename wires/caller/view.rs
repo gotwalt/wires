@@ -222,7 +222,7 @@ pub(crate) struct Refused(pub(crate) String);
 
 impl Refused {
     /// Whether the directory refused admission.
-    fn is_not_admitted(e: &anyhow::Error) -> bool {
+    pub(crate) fn is_not_admitted(e: &anyhow::Error) -> bool {
         e.downcast_ref::<Refused>()
             .is_some_and(|r| r.0 == crate::host::gate::NOT_ADMITTED)
     }

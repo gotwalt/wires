@@ -117,12 +117,6 @@ pub(crate) fn adopt_if_newer(
     Ok(true)
 }
 
-/// The network root this keystore belongs to
-/// ([`Keystore::network_root`]); `None` before `init`, `join` or `login`.
-pub(crate) fn fabric(ks: &Keystore) -> Result<Option<NodeId>> {
-    ks.network_root()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

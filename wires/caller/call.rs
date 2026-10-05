@@ -195,7 +195,7 @@ impl Credentials {
     }
 
     /// The network's root key.
-    pub(crate) fn fabric(&self) -> NodeId {
+    pub(crate) fn root(&self) -> NodeId {
         self.root
     }
 
@@ -538,7 +538,7 @@ where
     }
     let called = called?;
     if let Some(newer) = called.newer {
-        view::note_seen(ks, creds.fabric(), newer);
+        view::note_seen(ks, creds.root(), newer);
         if opts.refresh_after {
             let asker = view::Asker {
                 endpoint: dial.endpoint,

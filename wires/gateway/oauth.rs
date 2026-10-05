@@ -463,6 +463,13 @@ pub(crate) async fn callback<B: Backend>(
         Ok((_, tools)) => {
             tracing::info!("gateway: {who} signed in ({} services)", tools.tools.len())
         }
+        Err(e)
+            if e.downcast_ref::<crate::caller::view::NotAdmitted>()
+                .is_some() =>
+        {
+            tracing::info!("gateway: {who} is not admitted to this network; refused");
+            return back("access_denied", super::NOT_ADMITTED_HERE);
+        }
         Err(e) => {
             tracing::warn!("gateway: no view for {who}: {e:#}");
             return back(

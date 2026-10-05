@@ -70,17 +70,17 @@ pub(crate) const SCOPE: &str = "wires";
 /// `wires gateway` arguments. Secrets resolve flag → environment → file.
 #[derive(Args, Debug)]
 pub struct GatewayArgs {
-    /// The public origin clients reach (the MCP endpoint is `<origin>/mcp`).
-    // The OAuth issuer, e.g. `https://wires.positivesum.ai`. Falls back to
-    // `$WIRES_GATEWAY_URL`.
+    /// The public origin clients reach (the MCP endpoint is `<origin>/mcp`;
+    /// or `$WIRES_GATEWAY_URL`).
+    // The OAuth issuer, e.g. `https://wires.positivesum.ai`.
     #[arg(long)]
     pub public_url: Option<String>,
     /// Where to listen for HTTP (TLS is the tunnel's or proxy's job).
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub listen: SocketAddr,
-    /// The IdP's Web application client id (hosts must trust it as an audience).
-    // Its redirect URI is `<public-url>/oauth/callback`. Falls back to
-    // `$WIRES_GATEWAY_CLIENT_ID`.
+    /// The IdP's Web application client id, which hosts must trust as an
+    /// audience (or `$WIRES_GATEWAY_CLIENT_ID`).
+    // Its redirect URI is `<public-url>/oauth/callback`.
     #[arg(long)]
     pub client_id: Option<String>,
     /// Read the client secret from this file (or `$WIRES_GATEWAY_CLIENT_SECRET`).
@@ -164,6 +164,12 @@ pub(crate) trait Backend: Send + Sync + 'static {
     fn caller(&self, token: IdToken, view: Arc<View>) -> Self::Caller;
 }
 
+/// What a web user hears when a directory refuses them admission (no role
+/// matches them, or they were removed): the CLI's sentence, without the
+/// email (it goes back to the MCP client in a redirect or a reply).
+pub(crate) const NOT_ADMITTED_HERE: &str = "not admitted to this network: no role in this \
+network matches this account, or it was removed: ask your admin";
+
 /// How long a web user's first request waits for their view.
 const VIEW_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -212,7 +218,7 @@ impl Keystored {
         let token = session.id_token.clone();
         let (rx, task) = view::follow(view::Follow {
             endpoint: self.endpoint.clone(),
-            root: self.creds.fabric(),
+            root: self.creds.root(),
             id_token: Arc::new(move || Some(token.clone())),
             initial: None,
             fallback: self.directories.clone(),
@@ -230,11 +236,43 @@ impl Keystored {
     }
 }
 
+impl Keystored {
+    /// Whether the first directory that answers refuses `session`'s person
+    /// admission ([`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED)).
+    async fn refuses_admission(&self, session: &Session, now: i64) -> bool {
+        for &dir in &self.directories {
+            let asked = view::ask_view(
+                &self.endpoint,
+                dir,
+                Some(session.id_token.clone()),
+                self.creds.root(),
+                None,
+                None,
+                now,
+            )
+            .await;
+            match asked {
+                Ok(_) => return false,
+                Err(e) if view::Refused::is_not_admitted(&e) => return true,
+                Err(_) => continue,
+            }
+        }
+        false
+    }
+}
+
 impl Backend for Keystored {
     type Caller = PresentingCaller;
 
     async fn view(&self, session: &Session) -> Result<Arc<View>> {
-        let mut rx = self.watch(session, crate::clock::now_unix());
+        let now = crate::clock::now_unix();
+        let mut rx = self.watch(session, now);
+        // A directory refuses a person no role matches (or one removed)
+        // outright, and the subscription only retries: ask once, so they
+        // hear it now rather than as a timeout.
+        if rx.borrow().is_none() && self.refuses_admission(session, now).await {
+            return Err(anyhow!(crate::host::gate::NOT_ADMITTED).context(view::NotAdmitted));
+        }
         let held: Arc<HeldView> = tokio::time::timeout(VIEW_WAIT, rx.wait_for(Option::is_some))
             .await
             .map_err(|_| anyhow!("no directory gave this user's view within {VIEW_WAIT:?}"))?
@@ -564,9 +602,9 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
     // Where web users' views come from: the directories this node knows
     // (its own view's head, else its network string's, else its whole
     // policy's).
-    let mut directories = view::directories(&ks, creds.fabric(), node);
+    let mut directories = view::directories(&ks, creds.root(), node);
     if directories.is_empty()
-        && let Some(held) = crate::policy::store::read(&ks, creds.fabric())?
+        && let Some(held) = crate::policy::store::read(&ks, creds.root())?
     {
         directories = held
             .directories()

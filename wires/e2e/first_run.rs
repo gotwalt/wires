@@ -90,7 +90,7 @@ async fn edit(
 ) -> (Report, Propagation) {
     let earlier = held_directories(admin).unwrap();
     let report = edit(admin);
-    let root = store::fabric(admin).unwrap().unwrap();
+    let root = admin.network_root().unwrap().unwrap();
     let version = store::read(admin, root).unwrap().unwrap().version();
     let published = publish_current_on(endpoint, admin, &earlier).await;
     (report, settle(admin, published.map(|r| (version, r))))

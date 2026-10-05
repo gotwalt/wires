@@ -263,6 +263,14 @@ pub(crate) async fn post<B: Backend>(
     }
     let (view, tools) = match gw.tools_for(&session).await {
         Ok(found) => found,
+        Err(e)
+            if e.downcast_ref::<crate::caller::view::NotAdmitted>()
+                .is_some() =>
+        {
+            let said = super::NOT_ADMITTED_HERE;
+            let reply = error_response(id.unwrap_or(Value::Null), RpcError::new(-32000, said));
+            return json_reply(StatusCode::FORBIDDEN, &reply);
+        }
         Err(e) => {
             tracing::warn!("gateway: no view for this user: {e:#}");
             let reply = error_response(

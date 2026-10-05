@@ -881,7 +881,7 @@ pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
     let token_ks = Arc::clone(&ks);
     let (mut views, follower) = crate::caller::view::follow(crate::caller::view::Follow {
         endpoint: endpoint.clone(),
-        root: creds.fabric(),
+        root: creds.root(),
         id_token: Arc::new(move || crate::caller::hello::stored_token(&token_ks)),
         initial: held,
         fallback: crate::caller::view::joined_directories(&ks),
