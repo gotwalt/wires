@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "services": {
+    "gcp": {
+      "command": [
+        "/opt/wires-examples/services/gcp/wrapper.sh"
+      ],
+      "env": {
+        "ROLE_MAP": "/etc/wires-examples/gcp.roles",
+        "STATE_DIR": "/var/lib/wires-examples/gcp",
+        "GCP_WORKLOAD_PROVIDER": "projects/123456789012/locations/global/workloadIdentityPools/wires/providers/wires-idp",
+        "CLOUDSDK_CORE_PROJECT": "acme-prod"
+      }
+    }
+  }
+}

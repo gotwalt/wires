@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "services": {
+    "cloudflare": {
+      "command": [
+        "/opt/wires-examples/services/cloudflare/wrapper.sh"
+      ],
+      "env": {
+        "ROLE_MAP": "/etc/wires-examples/cloudflare.roles",
+        "HOME": "/var/lib/wires-examples/cloudflare",
+        "CLOUDFLARE_ACCOUNT_ID": "0123456789abcdef0123456789abcdef"
+      }
+    }
+  }
+}

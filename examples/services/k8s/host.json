@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "services": {
+    "k8s": {
+      "command": [
+        "/opt/wires-examples/services/k8s/wrapper.sh"
+      ],
+      "env": {
+        "ROLE_MAP": "/etc/wires-examples/k8s.roles",
+        "STATE_DIR": "/var/lib/wires-examples/k8s",
+        "K8S_SERVER": "https://k8s.acme.internal:6443",
+        "K8S_CA_FILE": "/etc/wires-examples/k8s-ca.crt"
+      }
+    }
+  }
+}

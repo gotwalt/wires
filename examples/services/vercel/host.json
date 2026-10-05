@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "services": {
+    "vercel": {
+      "command": [
+        "/opt/wires-examples/services/vercel/wrapper.sh"
+      ],
+      "env": {
+        "ROLE_MAP": "/etc/wires-examples/vercel.roles",
+        "HOME": "/var/lib/wires-examples/vercel"
+      }
+    }
+  }
+}
