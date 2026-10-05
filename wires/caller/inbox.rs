@@ -717,6 +717,11 @@ pub(crate) async fn inbox_cmd(a: InboxArgs) -> Result<i32> {
     let root = ks.network_root()?.context(crate::help::NOT_JOINED)?;
     let token = crate::caller::hello::stored_token(&ks)
         .ok_or_else(|| anyhow::anyhow!(crate::help::NOT_SIGNED_IN))?;
+    // The hosts asked are the view's: refreshed first when it is stale, as
+    // `wires call` does; with no directory answering, the view as it is.
+    if let Err(e) = crate::caller::view::usable(&ks, &node, root, c.relay_url.as_deref()).await {
+        eprintln!("wires inbox: {}", crate::help::brief(&e));
+    }
     let mailbox = Mailbox::open(&keystore::home()?)?;
     let deadline = a
         .timeout
@@ -784,10 +789,12 @@ struct Fetcher {
 impl Fetcher {
     /// The hosts of every service in the view (read now: a `--wait`
     /// subscription keeps it current), never this node, as dial targets.
+    /// None from an expired view.
     fn targets(&self) -> Vec<(NodeId, EndpointAddr)> {
+        let now = crate::clock::now_unix();
         let held = match crate::caller::view::read(&self.ks, self.fabric) {
-            Ok(Some(held)) => held,
-            Ok(None) => return Vec::new(),
+            Ok(Some(held)) if held.view.head.check_fresh(now).is_ok() => held,
+            Ok(_) => return Vec::new(),
             Err(e) => {
                 tracing::warn!("the stored view is unusable: {e:#}");
                 return Vec::new();
@@ -836,10 +843,11 @@ async fn read_loop(
             {
                 match fetched {
                     Fetched::Refused(reason) => {
+                        let said = crate::caller::hello::say_refusal(&fetcher.ks, &reason);
                         eprintln!(
-                            "wires inbox: host {} refused: {reason}{}",
+                            "wires inbox: host {} refused: {said}{}",
                             host.short(),
-                            crate::help::refusal_step(&reason)
+                            crate::help::refusal_step(&said)
                         );
                         refusals.push(reason);
                     }

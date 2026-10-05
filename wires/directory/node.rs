@@ -11,16 +11,23 @@
 //! admin's first publish.
 //!
 //! Who is asking is decided at the `hello` ([`Directory::admit`]): a node
-//! the held policy names as a host or directory ([`Peer::named`]), and a
-//! caller whose ID token verifies ([`Peer::principal`]) are admitted; anyone
-//! else may only publish. The directory verifies the token itself, as a
-//! host does (the policy's signed `issuer` items, the IdP's keys held in
-//! memory, the nonce bound to the iroh-authenticated key), and cuts the
-//! caller's **view** (card 37) from the policy it holds
+//! the held policy names as a host or directory ([`Peer::named`], by its
+//! key), and a caller whose ID token verifies and whom the policy admits
+//! ([`Peer::principal`]: [`library::check_admitted`], a verified email, no
+//! ban, a role that matches) are admitted; anyone else may only publish,
+//! and hears [`NOT_ADMITTED`] for anything more. The directory verifies the
+//! token itself, as a host does (the policy's signed `issuer` items, the
+//! IdP's keys held in memory, the nonce bound to the iroh-authenticated
+//! key), and cuts the caller's **view** (card 37) from the policy it holds
 //! ([`SignedPolicy::view_for`]): the root-signed entries its principal may
-//! call, none when the policy bans its node or person. Nothing per user is
-//! stored, and a request is traced, not logged: a view grants nothing (the
-//! host decides every call).
+//! call. Nothing per user is stored, and a request is traced, not logged: a
+//! view grants nothing (the host decides every call).
+//!
+//! Subscriptions come from two pools, so callers can't exhaust the hosts':
+//! [`Directory::subscribers`] for the nodes the policy names (`policy` and
+//! `replica`), and [`Directory::view_subscribers`] for callers' `view`
+//! subscriptions, at most [`MAX_VIEW_SUBSCRIPTIONS_PER_PERSON`] of them for
+//! one person ([`Directory::view_slot`]).
 //!
 //! Every change of head or freshness is published on a watch channel
 //! ([`Directory::watch`]), which the subscriptions follow.
@@ -80,10 +87,16 @@ pub(crate) struct Directory {
     /// Serializes accepts and beats (the store has one writer, and the
     /// head announced is always the newest held).
     write: std::sync::Mutex<()>,
-    /// The subscriber cap (local config).
+    /// The subscriber cap of each pool (local config).
     pub(crate) max_subscribers: usize,
-    /// The subscribers following now.
+    /// The `policy` and `replica` subscribers following now: nodes the
+    /// policy names. Callers never take one.
     pub(crate) subscribers: Arc<tokio::sync::Semaphore>,
+    /// The callers' `view` subscribers following now, apart from
+    /// [`subscribers`](Self::subscribers).
+    pub(crate) view_subscribers: Arc<tokio::sync::Semaphore>,
+    /// How many `view` subscriptions each person (issuer, subject) holds.
+    view_per_person: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), usize>>>,
     /// Connections not yet admitted (bounded: any key can dial). A permit
     /// is held from the connection until its `hello` is decided, never
     /// longer.
@@ -122,8 +135,14 @@ pub(crate) const MAX_ADMITTED: usize = 64;
 /// What an admitted node hears when [`MAX_ADMITTED`] are in hand.
 pub(crate) const BUSY: &str = "this directory is busy; try again or ask another";
 
-/// The default subscriber cap.
+/// The default subscriber cap, of each pool: the nodes the policy names
+/// (`policy` and `replica`), and callers' `view` subscriptions.
 pub(crate) const DEFAULT_MAX_SUBSCRIBERS: usize = 4096;
+
+/// How many `view` subscriptions one person (issuer and subject) may hold
+/// at once on a directory. Per person, not per node: a gateway holds one per
+/// web user from its one node.
+pub(crate) const MAX_VIEW_SUBSCRIPTIONS_PER_PERSON: usize = 16;
 
 /// What a node not admitted hears on either ALPN, whatever the reason.
 pub(crate) use crate::host::gate::NOT_ADMITTED;
@@ -140,14 +159,40 @@ pub(crate) struct Peer {
     /// The held policy names it as a host or a directory (and doesn't ban
     /// it): it may hold the whole policy.
     pub(crate) named: bool,
-    /// Who its ID token verified as, under the held policy's issuers.
+    /// Who its ID token verified as, under the held policy's issuers, when
+    /// the held policy admits that person ([`library::check_admitted`]);
+    /// `None` otherwise.
     pub(crate) principal: Option<Principal>,
 }
 
 impl Peer {
-    /// Whether it may ask more than a publish: named, or signed in.
+    /// Whether it may ask more than a publish: named, or an admitted
+    /// caller.
     pub(crate) fn admitted(&self) -> bool {
         self.named || self.principal.is_some()
+    }
+}
+
+/// One person's hold on a `view` subscription: a slot in
+/// [`Directory::view_subscribers`] and one of their
+/// [`MAX_VIEW_SUBSCRIPTIONS_PER_PERSON`]. Both are given back on drop.
+pub(crate) struct ViewSlot {
+    /// The pool slot.
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    /// Who holds it, and the count to give it back to.
+    person: (String, String),
+    per_person: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), usize>>>,
+}
+
+impl Drop for ViewSlot {
+    fn drop(&mut self) {
+        let mut held = self.per_person.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = held.get_mut(&self.person) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                held.remove(&self.person);
+            }
+        }
     }
 }
 
@@ -218,6 +263,8 @@ impl Directory {
             write: std::sync::Mutex::new(()),
             max_subscribers,
             subscribers: Arc::new(tokio::sync::Semaphore::new(max_subscribers)),
+            view_subscribers: Arc::new(tokio::sync::Semaphore::new(max_subscribers)),
+            view_per_person: Default::default(),
             undecided: Arc::new(tokio::sync::Semaphore::new(MAX_UNDECIDED)),
             admitted: Arc::new(tokio::sync::Semaphore::new(MAX_ADMITTED)),
             stream_deadline: super::wire::FRAME_TIMEOUT,
@@ -339,14 +386,30 @@ impl Directory {
     }
 
     /// Who `caller` is, from its `hello`'s `id_token` (see [`Peer`]): named
-    /// when the held policy names it as a host or directory, signed in when
-    /// the token verifies under the held policy. Holding no policy, it
-    /// admits nobody (anyone may still publish).
+    /// when the held policy names it as a host or directory (by its key), an
+    /// admitted caller when the token verifies under the held policy and
+    /// [`library::check_admitted`] passes (the reason it doesn't is traced).
+    /// Holding no policy, it admits nobody (anyone may still publish).
     pub(crate) async fn admit(&self, caller: NodeId, id_token: Option<&IdToken>, now: i64) -> Peer {
         let held = self.snapshot();
         let named = self.holds_whole(caller);
         let principal = match (held, id_token) {
-            (Some(c), Some(token)) => self.principal(caller, token, &c.held.policy, now).await,
+            (Some(c), Some(token)) => self
+                .principal(caller, token, &c.held.policy, now)
+                .await
+                .filter(
+                    |p| match library::check_admitted(&c.held.policy, caller, p) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::debug!(
+                                peer = %caller.hex(),
+                                who = %p.name(),
+                                "directory: not admitted: {e}"
+                            );
+                            false
+                        }
+                    },
+                ),
             _ => None,
         };
         Peer {
@@ -432,9 +495,9 @@ impl Directory {
     ///   whole (searched) view;
     /// - `resolve {service}`: a view holding just that service, or no entry.
     ///
-    /// Every view is cut for `peer`'s node and principal, so a banned node
-    /// or person gets the empty one. Traced, not logged (see the module
-    /// docs).
+    /// Every view is cut for `peer`'s node and admitted principal (a named
+    /// node with none gets the empty one). Traced, not logged (see the
+    /// module docs).
     pub(crate) fn answer(&self, peer: &Peer, request: DirectoryRequest) -> DirectoryAnswer {
         let denied = |reason: String| DirectoryAnswer::Denied {
             reason: crate::host::transport::truncate_reason(reason),
@@ -504,6 +567,35 @@ impl Directory {
             "directory: answered a view"
         );
         answer
+    }
+
+    /// A `view` subscription slot for `principal`: one of
+    /// [`view_subscribers`](Self::view_subscribers), and one of their
+    /// [`MAX_VIEW_SUBSCRIPTIONS_PER_PERSON`]; `Err` is the refusal.
+    pub(crate) fn view_slot(&self, principal: &Principal) -> Result<ViewSlot, String> {
+        let person = (principal.issuer.clone(), principal.subject.clone());
+        let mut held = self
+            .view_per_person
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let n = held.entry(person.clone()).or_default();
+        if *n >= MAX_VIEW_SUBSCRIPTIONS_PER_PERSON {
+            return Err(format!(
+                "you have {MAX_VIEW_SUBSCRIPTIONS_PER_PERSON} view subscriptions open here already"
+            ));
+        }
+        let Ok(slot) = Arc::clone(&self.view_subscribers).try_acquire_owned() else {
+            return Err(format!(
+                "this directory's subscriber cap ({}) is reached",
+                self.max_subscribers
+            ));
+        };
+        *n += 1;
+        Ok(ViewSlot {
+            _slot: slot,
+            person,
+            per_person: Arc::clone(&self.view_per_person),
+        })
     }
 
     /// Whether `node` may hold the whole policy (card 37): a host of one of

@@ -253,11 +253,18 @@ async fn the_registry_decides_who_runs_what() {
         "her view is current"
     );
 
-    // bob verifies, but is in no allowed role: refused, by name.
+    // bob is admitted (staff), but no role of his may call orders-db: one
+    // fixed sentence, no role named, the same as for a name nobody knows.
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "orders-db", &[]).await;
     assert_eq!(
         out.denied(),
-        "bob@example.com is in no role allowed to call orders-db (analyst)"
+        crate::host::gate::not_callable(&service("orders-db"))
+    );
+    assert!(!out.denied().contains("analyst"), "{}", out.denied());
+    let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "orders-dc", &[]).await;
+    assert_eq!(
+        out.denied(),
+        crate::host::gate::not_callable(&service("orders-dc"))
     );
 
     // alice with no sign-in: not admitted at all, and told to sign in.
@@ -282,7 +289,7 @@ async fn the_registry_decides_who_runs_what() {
     // A name the registry doesn't know; a stranger presenting bob's token
     // (bound to bob's key, not its own).
     let out = call(&w.alice, &host, w.hello(&w.alice, 1, true), "nope", &[]).await;
-    assert_eq!(out.denied(), "unknown service: nope");
+    assert_eq!(out.denied(), "no service named `nope` that you may call");
     let stranger = NodeIdentity::from_seed([66u8; 32]);
     let out = call(&stranger, &host, w.hello(&w.bob, 1, true), "status", &[]).await;
     assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
@@ -295,7 +302,8 @@ async fn a_trusted_issuer_cannot_vouch_for_another_issuers_people() {
         .await
         .unwrap();
     // The partner IdP verifies alice@example.com, and the host trusts it,
-    // but every role names alice's own IdP (or others): nothing admits her.
+    // but every role names alice's own IdP (or others): no role matches, so
+    // she is not in the network at all.
     let partner_hello = Hello {
         id_token: w.idp_partner.mint(
             &OidcNonce::for_node(&w.alice.node_id()),
@@ -305,13 +313,7 @@ async fn a_trusted_issuer_cannot_vouch_for_another_issuers_people() {
     };
     for svc in ["orders-db", "status"] {
         let out = call(&w.alice, &host, partner_hello.clone(), svc, &[]).await;
-        assert!(
-            out.denied().starts_with(&format!(
-                "alice@example.com is in no role allowed to call {svc}"
-            )),
-            "{}",
-            out.denied()
-        );
+        assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
     }
     // Her own IdP's token is admitted.
     let out = call(
@@ -359,7 +361,10 @@ async fn also_require_only_tightens() {
     );
     // bob is in neither: the registry refuses first (the host can't widen).
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "orders-db", &[]).await;
-    assert!(out.denied().contains("no role allowed to call orders-db"));
+    assert_eq!(
+        out.denied(),
+        crate::host::gate::not_callable(&service("orders-db"))
+    );
 }
 
 #[tokio::test]
@@ -559,7 +564,7 @@ async fn push_follows_the_signed_state() {
     let Fetched::Refused(why) = fetch(&w, &w.bob, &host, token(&w.bob)).await else {
         panic!("bob may not fetch");
     };
-    assert!(why.contains("no role allowed to receive pushes"), "{why}");
+    assert_eq!(why, crate::host::gate::INBOX_REFUSED);
 
     // Banned by the policy: her queue is dropped and her fetch refused.
     push.send(spec(&w.alice)).await.unwrap();

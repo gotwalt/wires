@@ -579,13 +579,15 @@ where
 ///
 /// 1. admission: its ID token (verified under the policy's issuers as
 ///    `identity.issuers` narrows them, unexpired, bound to `caller`), and
-///    that the policy bans neither the node nor the person
+///    [`library::check_admitted`]: a verified email, neither the node nor
+///    the person banned, a role that matches
 ///    ([`ServicesHost::admit_caller`](crate::host::gate::ServicesHost::admit_caller)).
 ///    Anyone else hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED)
 ///    (or that its sign-in expired, or the IdP is unreachable), writes no
 ///    log line, and is traced, throttled;
-/// 2. [`gate::admit`](crate::host::gate::admit): fresh → registered and
-///    assigned here → registry role → `also_require`;
+/// 2. [`gate::admit`](crate::host::gate::admit): fresh → the registry lets
+///    the caller call it (else one fixed sentence) → assigned here →
+///    `also_require`;
 /// 3. whether `host.json` implements the service.
 ///
 /// An admitted caller's refusal is a [`Frame::Denied`] plus its log line
@@ -662,8 +664,8 @@ where
         .await
     {
         Ok(verified) => verified,
-        Err((reason, detail)) => {
-            return Err(refuse_stranger(&mut send, caller, reason, &detail).await);
+        Err(refused) => {
+            return Err(refuse_stranger(&mut send, caller, refused.said, &refused.why).await);
         }
     };
     let principal = Some(verified.principal.clone());
@@ -1658,6 +1660,45 @@ mod tests {
         };
         let expired = refusal_by(&host, open(expired), caller_id().node_id()).await;
         assert_eq!(expired, crate::host::gate::SIGN_IN_EXPIRED);
+    }
+
+    /// A token that verifies is not enough: a person no role matches, and a
+    /// sign-in with no verified email (even under `staff`, a role that names
+    /// only the issuer), hear the same bytes as a stranger, at the first
+    /// message, and leave no identity behind.
+    #[tokio::test]
+    async fn a_verified_token_no_role_matches_or_without_an_email_is_not_admitted() {
+        let me = caller_id().node_id();
+        let nonce = library::OidcNonce::for_node(&me);
+        let idp = crate::testutil::test_idp();
+        let exp = crate::clock::now_unix() + 3600;
+        let open = |hello: Hello| encoded(&[Frame::Hello(hello), Frame::Invoke(invoke(&[]))]);
+        // `t` allows only an analyst: someone else.
+        let narrow = host_with(&["true"], |p| {
+            p.roles.insert(
+                library::RoleName::new("analyst").unwrap(),
+                vec![library::Matcher {
+                    email: Some("analyst@example.com".parse().unwrap()),
+                    ..library::Matcher::new(idp.issuer.as_str())
+                }],
+            );
+            p.roles.remove(&library::RoleName::new("staff").unwrap());
+            p.services.values_mut().for_each(|s| {
+                s.allow = vec![library::RoleName::new("analyst").unwrap()];
+            });
+        });
+        let outsider = refusal_by(&narrow, open(hello()), me).await;
+        let no_email = Hello {
+            id_token: idp.mint_for("caller@example.com", false, &nonce, exp),
+            ..hello()
+        };
+        let host = host_unshared(&["true"]);
+        let emailless = refusal_by(&host, open(no_email), me).await;
+        for r in [outsider, emailless] {
+            assert_eq!(r, crate::host::gate::NOT_ADMITTED);
+        }
+        assert!(narrow.identities.nodes().is_empty());
+        assert!(host.identities.nodes().is_empty());
     }
 
     /// A token that fails leaves nothing behind: no identity-index entry

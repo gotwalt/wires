@@ -4,18 +4,23 @@
 //! 1. the caller is admitted ([`ServicesHost::admit_caller`]): the ID token
 //!    in its `Hello` verifies under the policy's `issuer` items (as
 //!    `host.json` narrows them), is unexpired and nonce-bound to the
-//!    iroh-authenticated caller, and the host's signed policy bans neither
-//!    the node nor the person (removal is a ban; no restart needed, because
-//!    the policy is re-read per connection). Anyone else hears only
-//!    [`NOT_ADMITTED`] (or [`SIGN_IN_EXPIRED`], [`IDP_UNREACHABLE`]) and is
-//!    traced, throttled;
+//!    iroh-authenticated caller, and [`library::check_admitted`] passes: a
+//!    verified email, neither the node nor the person banned (removal is a
+//!    ban; no restart needed, because the policy is re-read per
+//!    connection), and some role in the policy matches the person. Anyone
+//!    else hears only [`NOT_ADMITTED`] (or [`SIGN_IN_EXPIRED`],
+//!    [`IDP_UNREACHABLE`]) and is traced, throttled;
 //! 2. the policy is fresh (its head's `not_after`) and, under the signed
 //!    `settings.freshness: strict`, vouched for by a current `Fresh` from a
 //!    directory ([`freshness`](super::freshness); `lenient`, the default,
 //!    only traces a lapse);
-//! 3. the service is registered, and assigned to **this** host
+//! 3. the registry allows the caller to call the service
+//!    ([`library::authorize`]: it exists, and a role in its `allow` admits
+//!    the caller). If not, whatever the reason, the caller hears one fixed
+//!    sentence ([`not_callable`]) and the reason goes to the trace: a host
+//!    tells an admitted caller nothing about services it may not call;
+//! 4. the service is assigned to **this** host
 //!    ([`Policy::assigns`](library::Policy::assigns));
-//! 4. the registry allows the caller's role ([`library::authorize`]);
 //! 5. the host's own `also_require` roles (`host.json`), which can only
 //!    narrow: the caller must be in **every** one of them.
 //!
@@ -48,12 +53,27 @@ use crate::host::identity::{Identities, Verified};
 use crate::host::transport::Throttle;
 use crate::policy::store::Held;
 
-/// The one refusal a peer that is not admitted hears, whatever the reason
-/// (no ID token, a malformed one, an untrusted issuer, another audience,
-/// another key's, a banned node or person). It says nothing about the
+/// The one refusal a peer that is not admitted hears, from a host or a
+/// directory, whatever the reason (no ID token, a malformed one, an
+/// untrusted issuer, another audience, another key's, no verified email, a
+/// banned node or person, no role that matches). It says nothing about the
 /// policy, its version or who is in it; the exact reason goes only to the
-/// host's trace.
-pub(crate) const NOT_ADMITTED: &str = "not admitted to this network; sign in with `wires login`";
+/// responder's trace. A signed-in caller says more, from its own token
+/// ([`crate::caller::hello::explain_not_admitted`]).
+pub(crate) const NOT_ADMITTED: &str =
+    "not admitted to this network: sign in with `wires login`, or ask your admin for a role";
+
+/// What an admitted caller hears for a service it may not call, whatever
+/// the reason (no such service, nobody allowed, no role of its in the
+/// `allow`): no role name, no policy version.
+pub(crate) fn not_callable(service: &ServiceName) -> String {
+    format!("no service named `{service}` that you may call")
+}
+
+/// What an admitted inbox fetcher hears when this host won't hand it pushes
+/// (`push.allow` doesn't admit it, the host pushes to no one, or can't
+/// decide now): no role name. The reason goes to the trace.
+pub(crate) const INBOX_REFUSED: &str = "inbox fetch refused: this host does not push to you";
 
 /// What a caller hears when its ID token verified but has expired: it is
 /// who it says, and signing in again is the whole remedy.
@@ -78,7 +98,8 @@ static LAPSES: Throttle = Throttle::new();
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PushRefusal {
     /// Its node, or the person it verified as here, is banned by the current
-    /// signed policy: what is queued for it goes.
+    /// signed policy: what is queued for it goes. (A principal the policy no
+    /// longer admits for another reason is [`Refused`](Self::Refused).)
     NotAdmitted(String),
     /// A node the push rule refuses, or a host that can't decide now.
     Refused(String),
@@ -90,6 +111,19 @@ impl fmt::Display for PushRefusal {
             PushRefusal::NotAdmitted(why) | PushRefusal::Refused(why) => f.write_str(why),
         }
     }
+}
+
+/// Why [`ServicesHost::admit_caller`] refused a peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NotAdmitted {
+    /// What the peer hears: [`NOT_ADMITTED`], [`SIGN_IN_EXPIRED`] or
+    /// [`IDP_UNREACHABLE`].
+    pub(crate) said: &'static str,
+    /// The exact reason, for this host's trace only.
+    pub(crate) why: String,
+    /// The policy bans the node or the person (an inbox fetch drops what is
+    /// queued for it).
+    pub(crate) banned: bool,
 }
 
 /// A call the gate admitted.
@@ -122,14 +156,24 @@ pub(crate) enum GateRefusal {
         /// The policy's version.
         version: StateVersion,
     },
-    /// The registry refused ([`library::authorize`]).
-    Registry {
-        /// The registry's reason.
-        refusal: Refusal,
-        /// The policy version it decided under.
-        version: StateVersion,
+    /// The policy no longer admits the caller ([`library::check_admitted`],
+    /// checked again before anything a removed caller could learn from).
+    /// The caller hears [`NOT_ADMITTED`].
+    NotAdmitted {
+        /// Why, for the trace.
+        why: String,
     },
-    /// The service exists, but the registry doesn't assign it to this host.
+    /// The registry refused ([`library::authorize`]): no such service,
+    /// nobody allowed, or no role of the caller's in its `allow`. The caller
+    /// hears [`not_callable`] whichever it was.
+    NotCallable {
+        /// The service asked for.
+        service: ServiceName,
+        /// The registry's reason, for the trace only.
+        refusal: Refusal,
+    },
+    /// The caller may call the service, but the registry doesn't assign it
+    /// to this host.
     NotAssigned {
         /// The service.
         service: ServiceName,
@@ -158,11 +202,8 @@ impl fmt::Display for GateRefusal {
                 version.0
             ),
             GateRefusal::Unvouched { .. } => f.write_str(STALE),
-            GateRefusal::Registry {
-                refusal: Refusal::Banned,
-                ..
-            } => f.write_str(NOT_ADMITTED),
-            GateRefusal::Registry { refusal, .. } => write!(f, "{refusal}"),
+            GateRefusal::NotAdmitted { .. } => f.write_str(NOT_ADMITTED),
+            GateRefusal::NotCallable { service, .. } => f.write_str(&not_callable(service)),
             GateRefusal::NotAssigned { service, version } => write!(
                 f,
                 "service {service} is not assigned to this host (signed policy version {})",
@@ -194,27 +235,33 @@ pub(crate) fn admit(
     let principal = Some(&verified.principal);
     let version = state.version();
     let s = &state.policy;
-    let registry = |refusal| GateRefusal::Registry { refusal, version };
-    // The bans again before anything a banned caller could learn from (the
-    // policy's freshness and version); admission checked them first
+    // Admission again before anything a removed caller could learn from
+    // (the policy's freshness and version); admission checked it first
     // ([`ServicesHost::admit_caller`]).
-    if library::check_admitted(s, caller, &verified.principal).is_err() {
-        return Err(registry(Refusal::Banned));
+    if let Err(e) = library::check_admitted(s, caller, &verified.principal) {
+        return Err(GateRefusal::NotAdmitted { why: e.to_string() });
     }
     state.check_fresh(now).map_err(|e| GateRefusal::Stale {
         version,
         why: e.to_string(),
     })?;
-    if s.service(service).is_none() {
-        return Err(registry(Refusal::UnknownService(service.clone())));
-    }
+    // Whether the caller may call it at all comes before anything about
+    // this host, so a service it may not call is told apart from nothing.
+    let role = authorize(s, caller, principal, service).map_err(|refusal| match refusal {
+        Refusal::Banned => GateRefusal::NotAdmitted {
+            why: refusal.to_string(),
+        },
+        refusal => GateRefusal::NotCallable {
+            service: service.clone(),
+            refusal,
+        },
+    })?;
     if !s.assigns(service, me) {
         return Err(GateRefusal::NotAssigned {
             service: service.clone(),
             version,
         });
     }
-    let role = authorize(s, caller, principal, service).map_err(registry)?;
     let also = config
         .services
         .get(service)
@@ -375,41 +422,57 @@ impl ServicesHost {
     /// Admit `caller`, presenting `token` in its `Hello`, under `state`: the
     /// token verifies (trusted issuer and audience under this policy as
     /// `host.json` narrows it, signature, unexpired, nonce bound to
-    /// `caller`), and the policy bans neither the node nor the person
-    /// ([`library::check_admitted`]). `Err` is what the peer hears
-    /// ([`NOT_ADMITTED`], [`SIGN_IN_EXPIRED`] or [`IDP_UNREACHABLE`]) and the
-    /// exact reason, for this host's trace only.
+    /// `caller`), and [`library::check_admitted`] passes (a verified email,
+    /// no ban on the node or the person, a role that matches). Only then is
+    /// the principal remembered ([`Identities::record`]), so a token that
+    /// fails, or a person the policy doesn't admit, leaves no entry. `Err`
+    /// says what the peer hears and why ([`NotAdmitted`]).
     pub(crate) async fn admit_caller(
         &self,
         state: &Held,
         caller: NodeId,
         token: &IdToken,
         now: i64,
-    ) -> std::result::Result<Verified, (&'static str, String)> {
+    ) -> std::result::Result<Verified, NotAdmitted> {
+        let refused = |said, why| NotAdmitted {
+            said,
+            why,
+            banned: false,
+        };
         let principal = match self.identities.verify_token(caller, token, now).await {
             Ok(p) => p,
             Err(VerifyError::Expired(p)) => {
-                return Err((
+                return Err(refused(
                     SIGN_IN_EXPIRED,
                     format!("the ID token for {} has expired", p.name()),
                 ));
             }
             Err(VerifyError::Unavailable(e)) => {
-                return Err((IDP_UNREACHABLE, format!("the IdP is unreachable: {e}")));
+                return Err(refused(
+                    IDP_UNREACHABLE,
+                    format!("the IdP is unreachable: {e}"),
+                ));
             }
-            Err(e) => return Err((NOT_ADMITTED, format!("the ID token did not verify: {e}"))),
+            Err(e) => {
+                return Err(refused(
+                    NOT_ADMITTED,
+                    format!("the ID token did not verify: {e}"),
+                ));
+            }
         };
-        if library::check_admitted(&state.policy, caller, &principal).is_err() {
-            return Err((
-                NOT_ADMITTED,
-                format!(
-                    "{} on {}… is removed by the signed policy (version {})",
+        if let Err(e) = library::check_admitted(&state.policy, caller, &principal) {
+            return Err(NotAdmitted {
+                said: NOT_ADMITTED,
+                why: format!(
+                    "{} on {}… is not admitted by the signed policy (version {}): {e}",
                     principal.name(),
                     caller.short(),
                     state.version().0
                 ),
-            ));
+                banned: matches!(e, library::Error::Banned),
+            });
         }
+        self.identities.record(caller, &Ok(principal.clone()));
         Ok(Verified {
             token: token.clone(),
             principal,
@@ -470,25 +533,38 @@ impl ServicesHost {
     ) -> std::result::Result<Admitted, String> {
         self.check_vouched(state, now).map_err(|r| r.to_string())?;
         admit(state, &self.config, self.me, caller, verified, service, now)
-            .inspect_err(|r| {
-                if let GateRefusal::AlsoRequire { roles, .. } = r {
-                    tracing::info!(
-                        caller = %caller.hex(),
-                        service = %service,
-                        also_require = ?roles.iter().map(RoleName::as_str).collect::<Vec<_>>(),
-                        "refused by this host's also_require"
-                    );
-                }
+            .inspect_err(|r| match r {
+                GateRefusal::AlsoRequire { roles, .. } => tracing::info!(
+                    caller = %caller.hex(),
+                    service = %service,
+                    also_require = ?roles.iter().map(RoleName::as_str).collect::<Vec<_>>(),
+                    "refused by this host's also_require"
+                ),
+                // The caller hears one fixed sentence; which it was is here.
+                GateRefusal::NotCallable { refusal, .. } => tracing::info!(
+                    caller = %caller.hex(),
+                    service = %service,
+                    why = %refusal,
+                    "refused by the registry"
+                ),
+                GateRefusal::NotAdmitted { why } => tracing::info!(
+                    caller = %caller.hex(),
+                    service = %service,
+                    why = %why,
+                    "no longer admitted"
+                ),
+                _ => {}
             })
             .map_err(|r| r.to_string())
     }
 
-    /// Whether `node` may receive pushes from this host at `now`: neither it
-    /// nor the person it last verified as here is banned by the current
-    /// signed policy, and it is in the first `push.allow` role that admits
-    /// it (with that principal). A node only has a principal here after it
-    /// presented a token that verified (on a call or a fetch), so a node
-    /// that never did is in no role.
+    /// Whether `node` may receive pushes from this host at `now`: the node
+    /// isn't banned, the person it last verified as here is still admitted
+    /// ([`library::check_admitted`]; a ban is [`PushRefusal::NotAdmitted`],
+    /// anything else [`PushRefusal::Refused`]), and it is in the first
+    /// `push.allow` role that admits it (with that principal). A node only
+    /// has a principal here after it was admitted (on a call or a fetch), so
+    /// a node that never was is in no role.
     pub(crate) fn decide_push(
         &self,
         node: NodeId,
@@ -505,15 +581,27 @@ impl ServicesHost {
             )));
         }
         let principal = self.identities.current(node, now);
-        let person_banned = principal
-            .as_ref()
-            .is_some_and(|p| state.policy.bans_person(p));
-        if state.policy.bans_node(node) || person_banned {
-            return Err(PushRefusal::NotAdmitted(format!(
-                "{} is removed by the current signed policy (version {})",
-                node.short(),
-                state.version().0
-            )));
+        let admitted = match &principal {
+            Some(p) => library::check_admitted(&state.policy, node, p),
+            None if state.policy.bans_node(node) => Err(library::Error::Banned),
+            None => Ok(()),
+        };
+        match admitted {
+            Ok(()) => {}
+            Err(library::Error::Banned) => {
+                return Err(PushRefusal::NotAdmitted(format!(
+                    "{} is removed by the current signed policy (version {})",
+                    node.short(),
+                    state.version().0
+                )));
+            }
+            Err(e) => {
+                return Err(PushRefusal::Refused(format!(
+                    "{} is no longer admitted by the current signed policy (version {}): {e}",
+                    node.short(),
+                    state.version().0
+                )));
+            }
         }
         let allow = self
             .config
@@ -550,8 +638,9 @@ impl ServicesHost {
     }
 
     /// The nodes `role` names at `now` (never this host): every node whose
-    /// last verified principal here is in the role, neither the node nor the
-    /// person banned. A node with no verified identity here is in no role.
+    /// last verified principal here is in the role and still admitted
+    /// ([`library::check_admitted`]). A node with no verified identity here
+    /// is in no role.
     pub(crate) fn push_recipients(&self, role: &RoleName, now: i64) -> Vec<NodeId> {
         let Ok(state) = self.policy() else {
             return Vec::new();
@@ -562,10 +651,9 @@ impl ServicesHost {
             .nodes()
             .into_iter()
             .filter(|n| {
-                let principal = self.identities.current(*n, now);
-                !s.bans_node(*n)
-                    && !principal.as_ref().is_some_and(|p| s.bans_person(p))
-                    && role_admits(s, role, principal.as_ref())
+                self.identities.current(*n, now).is_some_and(|p| {
+                    library::check_admitted(s, *n, &p).is_ok() && role_admits(s, role, Some(&p))
+                })
             })
             .collect();
         nodes.retain(|n| *n != self.me);
@@ -694,17 +782,83 @@ mod tests {
             let e = admit(&s, &cfg, node(3), node(2), &mallory, &status, now).unwrap_err();
             assert_eq!(e.to_string(), NOT_ADMITTED);
         }
+        // A service bob may call, on a host it isn't assigned to.
         assert!(matches!(
             admit(&s, &cfg, node(2), node(2), &bob, &status, 0),
             Err(GateRefusal::NotAssigned { .. })
         ));
         assert!(matches!(
             admit(&s, &cfg, node(3), node(2), &bob, &name("nope"), 0),
-            Err(GateRefusal::Registry {
+            Err(GateRefusal::NotCallable {
                 refusal: Refusal::UnknownService(_),
                 ..
             })
         ));
+    }
+
+    /// An admitted caller probing a service it isn't allowed, one nobody
+    /// is allowed, and one that doesn't exist hears the same bytes, naming
+    /// no role and no policy version, whichever host it asks; only for a
+    /// service it may call does it learn that this host doesn't serve it.
+    #[test]
+    fn a_service_you_may_not_call_sounds_like_one_that_does_not_exist() {
+        let (s, cfg) = strict();
+        let mut p = s.policy.clone();
+        p.services.insert(
+            name("locked"),
+            Service {
+                description: String::new(),
+                allow: vec![],
+                hosts: vec![node(3)],
+            },
+        );
+        let s = crate::testutil::held(&NodeIdentity::from_seed([1u8; 32]), p);
+        let bob = who("bob@x.com"); // staff, not analyst
+        for me in [node(3), node(4)] {
+            for probe in ["orders-db", "locked", "nope"] {
+                let e = admit(&s, &cfg, me, node(2), &bob, &name(probe), 0).unwrap_err();
+                assert!(matches!(e, GateRefusal::NotCallable { .. }), "{e:?}");
+                let said = e.to_string();
+                assert_eq!(
+                    said,
+                    format!("no service named `{probe}` that you may call")
+                );
+                for leak in ["analyst", "staff", "sre", "version", "5"] {
+                    assert!(!said.contains(leak), "{said}");
+                }
+            }
+        }
+        // The same name, existing (not his to call) or not existing at all:
+        // the same bytes.
+        let mut gone = s.policy.clone();
+        gone.services.remove(&name("orders-db"));
+        let gone = crate::testutil::held(&NodeIdentity::from_seed([1u8; 32]), gone);
+        let db = name("orders-db");
+        let there = admit(&s, &cfg, node(3), node(2), &bob, &db, 0).unwrap_err();
+        let absent = admit(&gone, &cfg, node(3), node(2), &bob, &db, 0).unwrap_err();
+        assert_eq!(there.to_string().as_bytes(), absent.to_string().as_bytes());
+        let status = admit(&s, &cfg, node(4), node(2), &bob, &name("status"), 0).unwrap_err();
+        assert!(
+            matches!(status, GateRefusal::NotAssigned { .. }),
+            "{status:?}"
+        );
+    }
+
+    /// A person the IdP verified but no role names, and one whose token
+    /// carries no verified email, are not admitted, even under a role that
+    /// names only the issuer.
+    #[test]
+    fn no_role_or_no_email_is_not_admitted() {
+        let (s, cfg) = setup();
+        let mut stranger = who("dave@elsewhere.example");
+        stranger.principal.issuer = "https://other-idp.example".into();
+        let mut no_email = who("bob@x.com");
+        no_email.principal.email = None;
+        for caller in [stranger, no_email] {
+            let e = admit(&s, &cfg, node(3), node(2), &caller, &name("status"), 0).unwrap_err();
+            assert!(matches!(e, GateRefusal::NotAdmitted { .. }), "{e:?}");
+            assert_eq!(e.to_string(), NOT_ADMITTED);
+        }
     }
 
     #[test]
@@ -719,7 +873,7 @@ mod tests {
         let carol = who("carol@x.com");
         assert!(matches!(
             admit(&s, &cfg, node(3), node(2), &carol, &db, 0),
-            Err(GateRefusal::Registry { .. })
+            Err(GateRefusal::NotCallable { .. })
         ));
         // alice without sre on the host side: refused by also_require.
         let mut state = s.policy.clone();

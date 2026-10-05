@@ -319,7 +319,7 @@ pub fn refusal(reason: &str) -> String {
 pub(crate) fn refusal_step(reason: &str) -> &'static str {
     if has_next_step(reason) {
         ""
-    } else if reason.starts_with("unknown service") || reason.contains("not assigned to this host")
+    } else if reason.starts_with("no service named") || reason.contains("not assigned to this host")
     {
         "; see `wires services`"
     } else if reason.starts_with("host configuration error") {

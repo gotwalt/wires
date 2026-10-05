@@ -558,6 +558,110 @@ async fn without_a_verified_identity_a_held_view_is_not_refreshed() {
     endpoint.close().await;
 }
 
+/// The view `wires call` and `wires inbox` dial from ([`view::usable`]):
+/// a day-old one is refreshed first when a directory answers, and with none
+/// answering it is dialed from as it is (calls never depend on a
+/// directory). (An expired one never is: `caller::call`'s tests.)
+#[tokio::test]
+async fn a_day_old_view_is_refreshed_before_call_and_inbox_dial_from_it() {
+    let w = World::new();
+    let root = w.root.node_id();
+    let v3 = w.policy(3, |_| {});
+    let serving = w.directory(&v3).await;
+    let ks = w.caller_keystore(true);
+    let endpoint = w.caller_endpoint().await;
+    let asker = Asker {
+        endpoint: &endpoint,
+        root,
+        id_token: crate::caller::hello::stored_token(&ks),
+    };
+    let mut held = view::refresh(&ks, &asker, false).await.unwrap();
+    // `status` is revoked at v4; the caller's view was last vouched for two
+    // days ago.
+    let mut p = v3.to_policy().unwrap();
+    p.version = StateVersion(4);
+    p.services.remove(&service("status"));
+    let v4 = p.sign_after(&w.root, &v3).unwrap();
+    assert!(serving.dir.accept(&v4, now_unix()).unwrap());
+    let day_old = now_unix() - 2 * view::VIEW_MAX_AGE_SECS;
+    held.checked = day_old;
+    view::write(&ks, root, &held).unwrap();
+    // Within a day, nothing is asked.
+    let asked = std::sync::atomic::AtomicBool::new(false);
+    let fresh = view::usable_with(&ks, root, day_old + 60, || async {
+        asked.store(true, std::sync::atomic::Ordering::SeqCst);
+        anyhow::bail!("not asked")
+    })
+    .await
+    .unwrap();
+    assert_eq!(fresh.version(), StateVersion(3));
+    assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
+    // A day on, the refresh comes first.
+    let refreshed = view::usable_with(&ks, root, now_unix(), || view::refresh(&ks, &asker, false))
+        .await
+        .unwrap();
+    assert_eq!(refreshed.version(), StateVersion(4));
+    let names: Vec<&str> = refreshed
+        .view
+        .entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(names, ["orders-db"]);
+    // With no directory answering, a stale view is dialed from as it is.
+    let mut stale = refreshed.clone();
+    stale.checked = day_old;
+    view::write(&ks, root, &stale).unwrap();
+    let kept = view::usable_with(&ks, root, now_unix(), || async {
+        anyhow::bail!("no directory answered")
+    })
+    .await
+    .unwrap();
+    assert_eq!(kept.version(), StateVersion(4));
+    endpoint.close().await;
+}
+
+/// A person the IdP verifies but no role names is not in the network: a
+/// directory refuses the refresh, and the error carries
+/// [`view::NotAdmitted`], so `wires login`, `wires services` and `wires
+/// call` can say what the person can act on.
+#[tokio::test]
+async fn a_signed_in_person_no_role_matches_is_told_so() {
+    let w = World::new();
+    let staffless = w.policy(3, |p| {
+        p.roles.remove(&role("staff"));
+        p.services.retain(|name, _| name.as_str() == "payroll");
+    });
+    let _serving = w.directory(&staffless).await;
+    let ks = w.caller_keystore(true);
+    let endpoint = w.caller_endpoint().await;
+    let asker = Asker {
+        endpoint: &endpoint,
+        root: w.root.node_id(),
+        id_token: crate::caller::hello::stored_token(&ks),
+    };
+    let e = view::refresh(&ks, &asker, true).await.unwrap_err();
+    assert!(e.downcast_ref::<view::NotAdmitted>().is_some(), "{e:#}");
+    let said = crate::caller::hello::explain_not_admitted_in(&ks);
+    assert_eq!(
+        said,
+        "not admitted to this network: no role in this network matches caller@example.com, or \
+         you were removed: ask your admin"
+    );
+    // With no view held, the view to dial from is that sentence.
+    let e = view::usable_with(&ks, w.root.node_id(), now_unix(), || {
+        view::refresh(&ks, &asker, true)
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        crate::help::brief(&e).starts_with(&said),
+        "{}",
+        crate::help::brief(&e)
+    );
+    endpoint.close().await;
+}
+
 /// A caller holding the empty view `wires join` stores, at the newest
 /// version, gets its entries once it presents a token that verifies: the
 /// directory answers `current` only for the view it would send.

@@ -141,9 +141,12 @@ impl Identities {
         self.trust.read().expect("identity trust poisoned").clone()
     }
 
-    /// Verify the ID token `node` presented (in a session or inbox `Hello`)
-    /// and record the verdict. The iroh-authenticated key presented it
-    /// itself, so the nonce binding to `node` is the whole proof.
+    /// Verify the ID token `node` presented (in a session or inbox `Hello`).
+    /// The iroh-authenticated key presented it itself, so the nonce binding
+    /// to `node` is the whole proof. Records nothing: the gate
+    /// ([`ServicesHost::admit_caller`](crate::host::gate::ServicesHost::admit_caller))
+    /// records a principal only once the policy admits it, so neither a
+    /// stranger nor an outsider the IdP knows can grow the index.
     pub(crate) async fn verify_token(
         &self,
         node: NodeId,
@@ -155,17 +158,14 @@ impl Identities {
             id_token: id_token.clone(),
         };
         let trust = self.trust();
-        let verdict = self
-            .fetcher
+        self.fetcher
             .verify(
                 &claim,
                 &trust.issuers(),
                 trust.audiences_for_claim(&claim),
                 now,
             )
-            .await;
-        self.record(node, &verdict);
-        verdict
+            .await
     }
 
     /// Fold one verdict about `node` into the index.

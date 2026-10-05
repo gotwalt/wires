@@ -235,7 +235,7 @@ mod tests {
         Principal {
             issuer: crate::testutil::test_idp().issuer.as_str().into(),
             subject: "1".into(),
-            email: None,
+            email: Some("me@example.com".into()),
             org: None,
             groups: vec![],
             not_after: i64::MAX,

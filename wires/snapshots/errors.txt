@@ -1,10 +1,6 @@
-wires: denied by host: not admitted to this network; sign in with `wires login` [exit 77]
+wires: denied by host: not admitted to this network: sign in with `wires login`, or ask your admin for a role [exit 77]
 
-wires: denied by host: carol@partner.example is in no role allowed to call orders-db (analyst); don't retry: ask your admin for access [exit 77]
-
-wires: denied by host: unknown service: orders-db; see `wires services` [exit 77]
-
-wires: denied by host: service orders-db allows no role; don't retry: ask your admin for access [exit 77]
+wires: denied by host: no service named `orders-db` that you may call; see `wires services` [exit 77]
 
 wires: denied by host: service orders-db is not assigned to this host (signed policy version 7); see `wires services` [exit 77]
 
@@ -17,6 +13,12 @@ wires: denied by host: your sign-in has expired; run `wires login` [exit 77]
 wires: denied by host: the identity provider is unreachable from this host; try again later [exit 77]
 
 wires: denied by host: host configuration error; try again later, or tell the host's operator [exit 77]
+
+wires: denied by host: not admitted to this network: no role in this network matches carol@partner.example, or you were removed: ask your admin [exit 77]
+
+wires: denied by host: not admitted to this network: your sign-in carries no verified email, and this network admits only a verified email: ask your admin [exit 77]
+
+wires: denied by host: not admitted to this network: your sign-in has expired; run `wires login` [exit 77]
 
 wires: no service named `orders-db` that you may call; see `wires services` [exit 1]
 

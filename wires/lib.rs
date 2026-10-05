@@ -412,7 +412,13 @@ fn print_report(result: anyhow::Result<admin::Report>) {
 /// admission" still lands here.
 fn exit_with(e: anyhow::Error) -> ! {
     if let Some(d) = e.downcast_ref::<host::transport::Denied>() {
-        eprintln!("wires: {}", help::refusal(d.reason()));
+        // A signed-in caller says what its person can act on, not just
+        // "not admitted" (read from its own stored token).
+        let reason = match admin::keystore::Keystore::resolve() {
+            Ok(ks) => caller::hello::say_refusal(&ks, d.reason()),
+            Err(_) => d.reason().to_owned(),
+        };
+        eprintln!("wires: {}", help::refusal(&reason));
         std::process::exit(EXIT_DENIED);
     }
     if VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {

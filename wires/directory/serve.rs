@@ -3,17 +3,19 @@
 //!
 //! - [`DirectoryProtocol`] (`wires/directory/2`): one request per
 //!   connection, after a `hello` ([`Directory::admit`]): a node the policy
-//!   names, or a caller whose ID token verifies, may ask; anyone may
-//!   publish (the head first, checked under the root, and only then its
-//!   items); anyone else asking hears only
-//!   [`NOT_ADMITTED`](super::node::NOT_ADMITTED), traced, not logged.
+//!   names, or a caller whose ID token verifies and whom the policy admits
+//!   ([`library::check_admitted`]), may ask; anyone may publish (the head
+//!   first, checked under the root, and only then its items); anyone else
+//!   asking hears only [`NOT_ADMITTED`](super::node::NOT_ADMITTED), traced,
+//!   not logged.
 //! - [`SubscriptionProtocol`] (`wires/directory-sub/2`): a `replica`
 //!   subscription from another directory the head lists: the whole policy
 //!   whenever it moves past what the subscriber holds, and a `fresh` beat
 //!   otherwise; a host's `policy` subscription, the whole policy once and
 //!   then `policy_update` deltas ([`sub_policy`](super::sub_policy)); a
 //!   caller's `view` subscription, the whole view once and then
-//!   `view_update` deltas ([`sub_view`](super::sub_view)).
+//!   `view_update` deltas ([`sub_view`](super::sub_view)), from a pool of
+//!   its own, so callers can't take the slots hosts and replicas need.
 //! - [`beat_loop`]: a new `Fresh` every `settings.beat_secs`.
 //! - [`replicate`]: follow every other directory the head lists as a
 //!   `replica`, and take any newer head it has, so a directory that missed
@@ -70,7 +72,8 @@ impl iroh::protocol::ProtocolHandler for DirectoryProtocol {
 }
 
 /// Accept `conn`'s one stream within `dir.stream_deadline` (a peer that
-/// never opens one gives up its undecided slot).
+/// never opens one gives up its undecided slot). The `hello` then gets as
+/// long again.
 async fn accept_stream(
     dir: &Directory,
     conn: &Connection,
@@ -278,12 +281,10 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
             return super::sub_policy::serve(dir, conn, &mut send, caller, have).await;
         }
         SubscriptionKind::View => {
+            // Only an admitted caller follows a view (a named node with no
+            // admitted principal has none to follow).
             let Some(principal) = peer.principal else {
-                return deny(
-                    &mut send,
-                    "a view subscription needs an ID token that verifies; run `wires login`".into(),
-                )
-                .await;
+                return deny(&mut send, NOT_ADMITTED.into()).await;
             };
             return super::sub_view::serve(dir, conn, &mut send, caller, principal).await;
         }
@@ -480,7 +481,7 @@ pub(crate) struct DirectoryServeArgs {
     /// Use a self-hosted relay at this URL instead of the n0 default.
     #[arg(long, hide = true)]
     pub(crate) relay_url: Option<String>,
-    /// How many subscribers this directory follows at once (one more is refused).
+    /// How many hosts and replicas may subscribe at once, and, apart, how many callers' views (one more is refused).
     #[arg(long, default_value_t = DEFAULT_MAX_SUBSCRIBERS)]
     pub(crate) max_subscribers: usize,
 }
